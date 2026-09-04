@@ -35,7 +35,14 @@ func recInfoBits(page []byte, recOff uint32) byte {
 	return page[recOff-5] & recInfoBitsMask
 }
 
+// recDeleted reports the delete-mark bit, dispatching on the page's own
+// COMPACT flag since the info-bits byte sits at a different header offset
+// for a REDUNDANT record (recOldInfoBits, below) than for a COMPACT/DYNAMIC
+// one (recInfoBits).
 func recDeleted(page []byte, recOff uint32) bool {
+	if !pageIsCompact(page) {
+		return recOldDeleted(page, recOff)
+	}
 	return recInfoBits(page, recOff)&recInfoDeletedFlag != 0
 }
 
@@ -59,11 +66,53 @@ func recNextOffset(page []byte, recOff uint32, pageSize uint32) uint32 {
 func recIsInfimum(pageOffset uint32) bool  { return pageOffset == pageNewInfimum }
 func recIsSupremum(pageOffset uint32) bool { return pageOffset == pageNewSupremum }
 
+// --- REDUNDANT ("old-style") record header - see redundant.go ---
+//
+// 6-byte header (page[recOff-6 : recOff]):
+//
+//	byte -6     : info_bits (high nibble) | n_owned (low nibble)
+//	bytes -5,-4 : big-endian uint16, heap_no (13 bits, >>3)
+//	bytes -4,-3 : big-endian uint16, n_fields (10 bits, >>1) - byte -4 is
+//	              shared between the heap_no and n_fields 16-bit windows
+//	bytes -2,-1 : big-endian uint16, ABSOLUTE next-record page offset
+//	              (unlike COMPACT, never relative, never wraps)
+
+// recOldInfoBits returns the high nibble of the OLD-format info byte
+// (rec-6): same bit meanings as recInfoBits, different byte offset.
+func recOldInfoBits(page []byte, recOff uint32) byte {
+	return page[recOff-6] & recInfoBitsMask
+}
+
+func recOldDeleted(page []byte, recOff uint32) bool {
+	return recOldInfoBits(page, recOff)&recInfoDeletedFlag != 0
+}
+
+// recOldNextOffset returns the absolute page offset of the next record in an
+// old-style (REDUNDANT) record chain, or 0 if the chain terminates.
+func recOldNextOffset(page []byte, recOff uint32) uint32 {
+	return uint32(binary.BigEndian.Uint16(page[recOff-2 : recOff]))
+}
+
+func recIsOldInfimum(pageOffset uint32) bool  { return pageOffset == pageOldInfimum }
+func recIsOldSupremum(pageOffset uint32) bool { return pageOffset == pageOldSupremum }
+
 // walkRecords calls fn for every non-infimum/non-supremum record on a single
 // page, in next-record chain order, stopping at supremum. It does not follow
 // FIL_PAGE_NEXT to a sibling page - callers that need the whole leaf level
 // do that themselves (see btree.go), since only they know when to stop.
+// Dispatches on the page's own COMPACT flag bit (PAGE_N_HEAP's top bit), not
+// the table's nominal ROW_FORMAT, since that's what InnoDB itself checks.
 func walkRecords(page []byte, pageSize uint32, fn func(recOff uint32) bool) {
+	if !pageIsCompact(page) {
+		off := recOldNextOffset(page, pageOldInfimum)
+		for off != 0 && !recIsOldSupremum(off) {
+			if !fn(off) {
+				return
+			}
+			off = recOldNextOffset(page, off)
+		}
+		return
+	}
 	off := recNextOffset(page, pageNewInfimum, pageSize)
 	for off != 0 && !recIsSupremum(off) {
 		if !fn(off) {

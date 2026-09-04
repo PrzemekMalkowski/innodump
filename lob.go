@@ -1,22 +1,97 @@
 // lob.go: fetches the current value of an externally-stored (off-page)
-// column through MySQL 8.0's "modern" LOB storage format (FIL_PAGE_TYPE_
-// LOB_FIRST / LOB_DATA pages). This is the straightforward "walk the
-// current index-entry list front to back" path; it deliberately does not
-// implement LOB *version* selection (JSON partial-update history), which
-// this tool has no use for since it only ever wants the row's current
-// value. Ported from ibdNinja's FetchModernUncompLob (ibdNinja.cc).
+// column, in whichever of the two formats its first page turns out to be:
 //
-// v1 supports only this modern, uncompressed LOB format (DYNAMIC/COMPACT
-// row formats without ROW_FORMAT=COMPRESSED, which is the whole of v1's
-// supported scope per schema.go). The older simple BLOB-page chain used by
-// REDUNDANT tables (FIL_PAGE_TYPE_BLOB, no LOB_FIRST framing) is not
-// implemented.
+//   - The modern LOB format (FIL_PAGE_TYPE_LOB_FIRST / LOB_DATA pages,
+//     fetchLOB) - the straightforward "walk the current index-entry list
+//     front to back" path. It deliberately does not implement LOB *version*
+//     selection (JSON partial-update history), which this tool has no use
+//     for since it only ever wants the row's current value. Ported from
+//     ibdNinja's FetchModernUncompLob (ibdNinja.cc).
+//   - The older, much simpler chain of FIL_PAGE_TYPE_BLOB pages (fetchOldBlob,
+//     built on the same fetchSimpleBlobChain helper sdi.go uses for
+//     FIL_PAGE_SDI_BLOB pages - it's the same on-disk structure, just a
+//     different FIL_PAGE_TYPE and no system-page reservation to guard
+//     against).
+//
+// Which one a given tablespace uses is a property of the tablespace itself
+// (whether it was ever laid out in the pre-5.6 "Antelope" file format, i.e.
+// FSP_FLAGS' atomic_blobs bit), not of the table's declared ROW_FORMAT: a
+// ROW_FORMAT=REDUNDANT table in a modern (any 5.6+, definitely any 8.0+)
+// per-table tablespace still gets the modern LOB format for its overflow
+// pages - confirmed empirically against a real MySQL 8.0.46 REDUNDANT table.
+// So rather than trust either the row format or the FSP flag, fetchExternal
+// just looks at the actual page it lands on and believes that instead.
 package main
 
 import (
 	"encoding/binary"
 	"fmt"
 )
+
+// fetchExternal fetches an externally-stored column's value, detecting
+// which off-page format it uses from its first page's own FIL_PAGE_TYPE.
+func fetchExternal(sp *Space, ref externalRef) ([]byte, error) {
+	first, err := sp.ReadPage(ref.PageNo)
+	if err != nil {
+		return nil, err
+	}
+	switch filType(first) {
+	case filPageTypeLOBFirst:
+		return fetchLOB(sp, ref)
+	case filPageTypeBlob:
+		return fetchOldBlob(sp, ref)
+	default:
+		return nil, fmt.Errorf("page %d has type %d, neither a LOB_FIRST nor a BLOB page", ref.PageNo, filType(first))
+	}
+}
+
+// fetchOldBlob follows a FIL_PAGE_TYPE_BLOB chain (the pre-5.6 "Antelope"
+// off-page storage format) to recover a column value stored there.
+func fetchOldBlob(sp *Space, ref externalRef) ([]byte, error) {
+	return fetchSimpleBlobChain(sp, ref.PageNo, int(ref.Length), filPageTypeBlob, 0)
+}
+
+// fetchSimpleBlobChain walks a chain of pages sharing the oldest, simplest
+// InnoDB off-page format: an 8-byte header (4-byte part length, 4-byte next
+// page number) at FIL_PAGE_DATA, followed immediately by that many data
+// bytes. Used for both FIL_PAGE_TYPE_BLOB (REDUNDANT's off-page columns,
+// lob.go) and FIL_PAGE_SDI_BLOB (the SDI's own overflow storage, sdi.go).
+// minPageNo rejects a chain that (corrupt or not) points back into the
+// tablespace's reserved system pages (0..3 for SDI; unused, i.e. 0, for a
+// plain BLOB chain, which is free to start as low as page 4 like any other
+// allocated page).
+func fetchSimpleBlobChain(sp *Space, firstPage uint32, want int, wantType uint16, minPageNo uint32) ([]byte, error) {
+	const hdrPartLen = 0
+	const hdrNextPage = 4
+	const hdrSize = 8
+	out := make([]byte, 0, want)
+	pageNo := firstPage
+	for len(out) < want {
+		page, err := sp.ReadPage(pageNo)
+		if err != nil {
+			return nil, err
+		}
+		if filType(page) != wantType {
+			return nil, fmt.Errorf("expected page type %d at page %d, got %d", wantType, pageNo, filType(page))
+		}
+		partLen := binary.BigEndian.Uint32(page[filPageData+hdrPartLen:])
+		start := filPageData + hdrSize
+		end := start + int(partLen)
+		if end > len(page)-filPageDataEnd || len(out)+int(partLen) > want {
+			return nil, fmt.Errorf("corrupt blob page %d: part length out of range", pageNo)
+		}
+		out = append(out, page[start:end]...)
+		next := binary.BigEndian.Uint32(page[filPageData+hdrNextPage:])
+		if len(out) >= want {
+			break
+		}
+		if next == filNull || next <= minPageNo {
+			return nil, fmt.Errorf("truncated blob chain at page %d", pageNo)
+		}
+		pageNo = next
+	}
+	return out, nil
+}
 
 const (
 	lobFirstPageDataLen    = 16

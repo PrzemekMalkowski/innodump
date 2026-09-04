@@ -104,38 +104,10 @@ type sdiRow struct {
 }
 
 // sdiFetchBlob follows a FIL_PAGE_SDI_BLOB chain to recover data stored
-// off-page for one SDI row.
+// off-page for one SDI row. Same on-disk structure as REDUNDANT's plain
+// FIL_PAGE_TYPE_BLOB chain - see lob.go's fetchSimpleBlobChain.
 func sdiFetchBlob(sp *Space, firstPage uint32, want int) ([]byte, error) {
-	const lobHdrPartLen = 0
-	const lobHdrNextPage = 4
-	const lobHdrSize = 8
-	out := make([]byte, 0, want)
-	pageNo := firstPage
-	for len(out) < want {
-		page, err := sp.ReadPage(pageNo)
-		if err != nil {
-			return nil, err
-		}
-		if filType(page) != filPageSDIBlob {
-			return nil, fmt.Errorf("expected SDI_BLOB page at %d, got type %d", pageNo, filType(page))
-		}
-		partLen := binary.BigEndian.Uint32(page[filPageData+lobHdrPartLen:])
-		start := filPageData + lobHdrSize
-		end := start + int(partLen)
-		if end > len(page)-filPageDataEnd || len(out)+int(partLen) > want {
-			return nil, fmt.Errorf("corrupt SDI_BLOB page %d: part length out of range", pageNo)
-		}
-		out = append(out, page[start:end]...)
-		next := binary.BigEndian.Uint32(page[filPageData+lobHdrNextPage:])
-		if len(out) >= want {
-			break
-		}
-		if next <= sdiBlobAllowed {
-			return nil, fmt.Errorf("truncated SDI_BLOB chain at page %d", pageNo)
-		}
-		pageNo = next
-	}
-	return out, nil
+	return fetchSimpleBlobChain(sp, firstPage, want, filPageSDIBlob, sdiBlobAllowed)
 }
 
 // sdiParseRecord decodes one SDI row at recOff on page, resolving any

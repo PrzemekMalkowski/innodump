@@ -32,11 +32,17 @@ type fieldRange struct {
 }
 
 // decodeRecordFields returns one fieldRange per entry in t.PhysicalFields,
-// for the ordinary (REC_STATUS_ORDINARY) leaf record at recOff on page. It
-// dispatches on the record's own info-bit flags and the table's INSTANT ADD/
-// DROP COLUMN state - see instant.go's package comment for the four
-// resulting cases (this mirrors Record::GetInsertState in ibdNinja).
+// for the ordinary leaf record at recOff on page. REDUNDANT records (see
+// redundant.go) have no separate "status" field or instant/version history
+// to dispatch on - the field-offset array alone determines everything, so
+// they're handled first and entirely separately. Everything else dispatches
+// on the record's own info-bit flags and the table's INSTANT ADD/DROP COLUMN
+// state - see instant.go's package comment for the four resulting cases
+// (this mirrors Record::GetInsertState in ibdNinja).
 func decodeRecordFields(page []byte, recOff uint32, t *Table) ([]fieldRange, error) {
+	if !pageIsCompact(page) {
+		return decodeFieldRangesOld(page, recOff, t.PhysicalFields), nil
+	}
 	if recStatus(page, recOff) != recStatusOrdinary {
 		return nil, fmt.Errorf("not an ordinary record (status=%d)", recStatus(page, recOff))
 	}

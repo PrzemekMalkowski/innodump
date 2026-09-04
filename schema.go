@@ -607,22 +607,31 @@ func buildColumn(raw ddColumnJSON) (*Column, error) {
 
 // BuildTable resolves a raw SDI dd_object into the model record.go and
 // btree.go need, or returns a descriptive error for a v1-unsupported table
-// (compressed/redundant row format or partitioning). INSTANT ADD/DROP COLUMN
-// history (either MySQL's 8.0.12-8.0.28 mechanism or the 8.0.29+ row
-// -versioning one that superseded it) is supported - see instant.go.
+// (page-compressed tablespace or partitioning). REDUNDANT, COMPACT, and
+// DYNAMIC row formats are all supported (REDUNDANT's very different record
+// layout is handled in redundant.go); INSTANT ADD/DROP COLUMN history
+// (either MySQL's 8.0.12-8.0.28 mechanism or the 8.0.29+ row-versioning one
+// that superseded it) is supported for COMPACT/DYNAMIC - see instant.go. A
+// REDUNDANT table combined with row versioning is rare enough (it requires
+// an INSTANT DROP, or an INSTANT ADD after 8.0.29, on a table nobody ever
+// converted off REDUNDANT) that it's reported rather than decoded.
 func BuildTable(raw *ddTableJSON) (*Table, error) {
 	if raw.PartitionType != 0 {
 		return nil, fmt.Errorf("partitioned tables are not supported (v1 limitation)")
 	}
-	if raw.RowFormat != rowFormatDynamic && raw.RowFormat != rowFormatCompact {
-		return nil, fmt.Errorf("ROW_FORMAT %s is not supported; only DYNAMIC and COMPACT are (v1 limitation)", rowFormatName(raw.RowFormat))
+	if raw.RowFormat != rowFormatDynamic && raw.RowFormat != rowFormatCompact && raw.RowFormat != rowFormatRedundant {
+		return nil, fmt.Errorf("ROW_FORMAT %s is not supported (v1 limitation)", rowFormatName(raw.RowFormat))
 	}
+	isRedundant := raw.RowFormat == rowFormatRedundant
 
 	colsByOpx := make([]*Column, len(raw.Columns)) // original SDI array order
 	for i, rc := range raw.Columns {
 		c, err := buildColumn(rc)
 		if err != nil {
 			return nil, err
+		}
+		if isRedundant && c.HasPhysPos {
+			return nil, fmt.Errorf("column %q has row-versioning info on a REDUNDANT table, which v1 does not decode (rare combination)", rc.Name)
 		}
 		colsByOpx[i] = c
 	}

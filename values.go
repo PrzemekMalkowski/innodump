@@ -61,7 +61,7 @@ func decodeField(sp *Space, col *Column, page []byte, fr fieldRange) (lit string
 		if err != nil {
 			return "", fmt.Errorf("column %q: %w", col.Name, err)
 		}
-		off, err := fetchLOB(sp, ref)
+		off, err := fetchExternal(sp, ref)
 		if err != nil {
 			return "", fmt.Errorf("column %q: fetching external value: %w", col.Name, err)
 		}

@@ -47,6 +47,7 @@ const (
 	filPageTypeLOBFirst = 24
 	filPageTypeLOBData  = 23
 	filPageSDIBlob      = 18
+	filPageTypeBlob     = 10 // REDUNDANT's off-page storage (simple chain, no LOB_FIRST framing)
 )
 
 const filNull = 0xFFFFFFFF
@@ -316,6 +317,11 @@ const (
 	recNNewExtraBytes = 5
 	pageNewInfimum    = pageData + recNNewExtraBytes       // 99
 	pageNewSupremum   = pageData + 2*recNNewExtraBytes + 8 // 112
+
+	// REDUNDANT ("old-style") records use a 6-byte header instead of 5.
+	recNOldExtraBytes = 6
+	pageOldInfimum    = pageData + 1 + recNOldExtraBytes       // 101
+	pageOldSupremum   = pageData + 2 + 2*recNOldExtraBytes + 8 // 116
 )
 
 func pageIsCompact(page []byte) bool {

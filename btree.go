@@ -24,14 +24,20 @@ func leftmostLeaf(sp *Space, t *Table) (uint32, error) {
 		if pc := checkPage(page); !pc.OK {
 			return 0, fmt.Errorf("page %d (index %q, id %d): %s", cur, t.IndexName, t.IndexID, pc.Reason)
 		}
-		if recStatus(page, pageNewInfimum) != recStatusInfimum {
-			return 0, fmt.Errorf("corrupt index page %d: expected infimum", cur)
+		compact := pageIsCompact(page)
+		var recOff uint32
+		if compact {
+			if recStatus(page, pageNewInfimum) != recStatusInfimum {
+				return 0, fmt.Errorf("corrupt index page %d: expected infimum", cur)
+			}
+			recOff = recNextOffset(page, pageNewInfimum, sp.PageSize)
+		} else {
+			recOff = recOldNextOffset(page, pageOldInfimum)
 		}
-		recOff := recNextOffset(page, pageNewInfimum, sp.PageSize)
 		if recOff == 0 {
 			return 0, fmt.Errorf("corrupt index page %d: empty non-leaf page", cur)
 		}
-		child, err := nonLeafChildPage(page, recOff, t)
+		child, err := nonLeafChildPage(page, recOff, t, compact)
 		if err != nil {
 			return 0, fmt.Errorf("page %d: %w", cur, err)
 		}
@@ -50,8 +56,13 @@ func leftmostLeaf(sp *Space, t *Table) (uint32, error) {
 
 // nonLeafChildPage decodes a node-pointer record's key prefix (the PRIMARY
 // KEY columns, or DB_ROW_ID if the table has no explicit PK) followed by
-// the 4-byte child page number, and returns that child page number.
-func nonLeafChildPage(page []byte, recOff uint32, t *Table) (uint32, error) {
+// the 4-byte child page number, and returns that child page number. Neither
+// row versioning nor a REC_OLD_SHORT-style per-record format choice ever
+// applies to a node-pointer record's key columns (only leaf rows can have
+// evolved schemas), so this needs none of decodeRecordFields' dispatch -
+// just the right one of the two plain field-range decoders for the page's
+// own COMPACT flag.
+func nonLeafChildPage(page []byte, recOff uint32, t *Table, compact bool) (uint32, error) {
 	nUniq := len(t.PKFields)
 	if !t.HasExplicitPK {
 		nUniq = 1
@@ -60,17 +71,24 @@ func nonLeafChildPage(page []byte, recOff uint32, t *Table) (uint32, error) {
 		return 0, fmt.Errorf("index metadata is inconsistent (n_uniq=%d > %d physical fields)", nUniq, len(t.PhysicalFields))
 	}
 	keyFields := t.PhysicalFields[:nUniq]
-	nNull := 0
-	for _, f := range keyFields {
-		if f.Col.IsNullable {
-			nNull++
-		}
-	}
 	childField := &IndexField{Col: &Column{FixedLen: 4}, EffFixedLen: 4}
 	fields := append(append([]*IndexField(nil), keyFields...), childField)
-	ranges, err := decodeFieldRanges(page, recOff, fields, nNull)
-	if err != nil {
-		return 0, err
+
+	var ranges []fieldRange
+	if compact {
+		nNull := 0
+		for _, f := range keyFields {
+			if f.Col.IsNullable {
+				nNull++
+			}
+		}
+		var err error
+		ranges, err = decodeFieldRanges(page, recOff, fields, nNull)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		ranges = decodeFieldRangesOld(page, recOff, fields)
 	}
 	last := ranges[len(ranges)-1]
 	if last.Null || int(last.End) > len(page) {
