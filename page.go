@@ -1,5 +1,6 @@
 // ibd-extractor - offline schema+data extraction from a MySQL 8.0/8.4 InnoDB
-// .ibd file (one table per file, ROW_FORMAT=DYNAMIC/COMPACT, uncompressed).
+// .ibd file (one table per file, ROW_FORMAT=DYNAMIC/COMPACT/REDUNDANT,
+// uncompressed or COMPRESSED - see zipdecompress.go).
 //
 // page.go: the FIL/FSP layer - page size detection, the common 38-byte FIL
 // page header every page starts with, and raw page I/O.
@@ -48,6 +49,8 @@ const (
 	filPageTypeLOBData  = 23
 	filPageSDIBlob      = 18
 	filPageTypeBlob     = 10 // REDUNDANT's off-page storage (simple chain, no LOB_FIRST framing)
+	filPageTypeZBlob    = 11 // ROW_FORMAT=COMPRESSED's off-page storage (not supported - see lob.go)
+	filPageTypeZBlob2   = 12
 )
 
 const filNull = 0xFFFFFFFF
@@ -148,18 +151,24 @@ func xdesSize(pageSize uint32) uint32 {
 }
 
 // Space wraps an open .ibd file and knows how to fetch individual pages.
+// For a ROW_FORMAT=COMPRESSED tablespace, PageSize (the *logical* page
+// size, always what every other file in this tool means by "the page
+// size") and PhysPageSize (the smaller zip_size actually on disk) differ;
+// for an uncompressed one they're the same value. See zipdecompress.go.
 type Space struct {
-	f        *os.File
-	PageSize uint32 // logical page size (== physical: v1 supports uncompressed only)
-	NumPages uint32
-	SpaceID  uint32
-	Flags    fspFlags
-	page0    []byte // lazily cached by f0()
+	f            *os.File
+	PageSize     uint32 // logical page size
+	PhysPageSize uint32 // on-disk page size (== PageSize unless Compressed)
+	Compressed   bool
+	NumPages     uint32
+	SpaceID      uint32
+	Flags        fspFlags
+	page0        []byte // lazily cached by f0()
 }
 
 // OpenSpace opens path and determines its page size from the FSP header on
-// page 0. Returns an error for compressed/encrypted/temporary tablespaces,
-// which v1 does not support.
+// page 0. Returns an error for encrypted/temporary tablespaces, which v1
+// does not support.
 func OpenSpace(path string) (*Space, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -190,9 +199,13 @@ func OpenSpace(path string) (*Space, error) {
 		f.Close()
 		return nil, fmt.Errorf("could not determine a valid page size (flags=0x%08x)", rawFlags)
 	}
+	physPageSize := pageSize
 	if flags.zipSSize != 0 {
-		f.Close()
-		return nil, fmt.Errorf("ROW_FORMAT=COMPRESSED / page-compressed tablespaces are not supported (v1 limitation)")
+		physPageSize = (1024 >> 1) << flags.zipSSize // 512 << ssize
+		if physPageSize < 1024 || physPageSize > pageSize {
+			f.Close()
+			return nil, fmt.Errorf("could not determine a valid compressed page size (flags=0x%08x)", rawFlags)
+		}
 	}
 	if flags.encryption {
 		f.Close()
@@ -205,25 +218,84 @@ func OpenSpace(path string) (*Space, error) {
 
 	spaceID := binary.BigEndian.Uint32(head[filPageSpaceID:])
 	return &Space{
-		f:        f,
-		PageSize: pageSize,
-		NumPages: uint32(fi.Size() / int64(pageSize)),
-		SpaceID:  spaceID,
-		Flags:    flags,
+		f:            f,
+		PageSize:     pageSize,
+		PhysPageSize: physPageSize,
+		Compressed:   flags.zipSSize != 0,
+		NumPages:     uint32(fi.Size() / int64(physPageSize)),
+		SpaceID:      spaceID,
+		Flags:        flags,
 	}, nil
 }
 
 func (s *Space) Close() error { return s.f.Close() }
 
-// ReadPage returns the raw bytes of page pageNo.
+// ReadPage returns the raw, physical, on-disk bytes of page pageNo -
+// exactly what's stored there, at its native (zip_size, for a compressed
+// tablespace) size. This is what checksum verification always runs
+// against (checkPage), and it's the right and only sensible thing to hand
+// back for any page type this tool doesn't decompress (FSP_HDR, XDES, a
+// BLOB/LOB chain - none of which are laid out any differently just
+// because the tablespace happens to be compressed). For a FIL_PAGE_INDEX
+// or FIL_PAGE_SDI page in a compressed tablespace, though, callers need
+// the *logical*, decompressed page instead - see Decompress.
 func (s *Space) ReadPage(pageNo uint32) ([]byte, error) {
-	buf := make([]byte, s.PageSize)
-	off := int64(pageNo) * int64(s.PageSize)
+	buf := make([]byte, s.PhysPageSize)
+	off := int64(pageNo) * int64(s.PhysPageSize)
 	n, err := s.f.ReadAt(buf, off)
 	if err != nil && n != len(buf) {
 		return nil, fmt.Errorf("reading page %d: %w", pageNo, err)
 	}
 	return buf, nil
+}
+
+// Decompress turns a page's raw physical bytes (as returned by ReadPage)
+// into the full logical page every other file in this tool expects,
+// reconstructing it from its dense directory and compressed record data if
+// this is a compressed tablespace's FIL_PAGE_INDEX or FIL_PAGE_SDI page -
+// see zipdecompress.go - and returning raw unchanged for anything else
+// (an uncompressed tablespace, or any other page type: FSP_HDR, XDES, a
+// BLOB/LOB chain - none of which are laid out any differently just
+// because the tablespace happens to be compressed).
+//
+// Every call site validates a page (checkPage, and usually also its
+// FIL_PAGE_TYPE/index id) *before* calling this, using the fields that
+// are always readable straight off the raw physical bytes because the
+// page header is copied verbatim into the compressed format too - so
+// decompression is only ever attempted on a page already known to be the
+// right type and, where checked, the right index. The recover() here is
+// still worth having: shape describes the caller's own expected index, and
+// a page that passed every one of those checks yet still doesn't actually
+// match it (a corrupt index id byte that happens to collide, say) could
+// otherwise turn a bad file into a crash instead of a clean error.
+func (s *Space) Decompress(raw []byte, shape zipIndexShape) (page []byte, err error) {
+	if !s.Compressed {
+		return raw, nil
+	}
+	switch filType(raw) {
+	case filPageIndex, filPageSDI:
+	default:
+		return raw, nil
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			page, err = nil, fmt.Errorf("decompressing page: panic: %v", r)
+		}
+	}()
+	return decompressIndexPage(raw, s.PageSize, shape)
+}
+
+// ReadIndexPage is ReadPage+Decompress in one call, for the (few) call
+// sites - all in sdi.go - that read a FIL_PAGE_SDI page without any
+// checkPage/index-id validation of their own to sequence Decompress after
+// (the SDI walk has never been corruption-hardened the way the target
+// table's own clustered index is - see btree.go).
+func (s *Space) ReadIndexPage(pageNo uint32, shape zipIndexShape) ([]byte, error) {
+	raw, err := s.ReadPage(pageNo)
+	if err != nil {
+		return nil, err
+	}
+	return s.Decompress(raw, shape)
 }
 
 // --- Page corruption detection ---
@@ -257,10 +329,32 @@ type pageCheck struct {
 	Reason string
 }
 
-func checkPage(page []byte) pageCheck {
+// checkPage validates page's checksum and LSN consistency. compressed
+// tells it not to expect the redundant checksum+LSN trailer an
+// uncompressed page's last 8 bytes always carry: a ROW_FORMAT=COMPRESSED
+// page's last bytes are its own dense page directory instead (see
+// zipdecompress.go), and its checksum is computed and verified by a
+// different algorithm this tool does not implement - such a page is only
+// checked for the "all zero" (unallocated) case, matching how the legacy
+// "innodb" checksum algorithm is already left unverified (see this
+// function's package doc comment, above checkPage's const block).
+func checkPage(page []byte, compressed bool) pageCheck {
 	n := len(page)
 	if n < filPageData+filPageDataEnd {
 		return pageCheck{Reason: "page is shorter than a valid FIL header+trailer"}
+	}
+	if compressed {
+		f1 := binary.BigEndian.Uint32(page[0:4])
+		lsn8 := binary.BigEndian.Uint64(page[filPageLSN:])
+		if f1 == 0 && lsn8 == 0 {
+			for _, b := range page {
+				if b != 0 {
+					return pageCheck{Reason: "checksum and LSN fields are zero but the page is not"}
+				}
+			}
+			return pageCheck{OK: true, Empty: true}
+		}
+		return pageCheck{OK: true}
 	}
 	if !bytes.Equal(page[filPageLSN+4:filPageLSN+8], page[n-4:n]) {
 		return pageCheck{Reason: "LSN low bytes at the start and end of the page disagree"}
@@ -326,6 +420,13 @@ const (
 
 func pageIsCompact(page []byte) bool {
 	return binary.BigEndian.Uint16(page[pageNHeap:])&0x8000 != 0
+}
+
+// pageGetNHeap returns PAGE_N_HEAP with its high "is compact" bit masked
+// off - the true count of heap records ever allocated on this page
+// (infimum/supremum plus every user record, live or on the free list).
+func pageGetNHeap(page []byte) uint16 {
+	return binary.BigEndian.Uint16(page[pageNHeap:]) &^ 0x8000
 }
 func pageGetLevel(page []byte) uint16 { return binary.BigEndian.Uint16(page[pageLevel:]) }
 func pageGetNRecs(page []byte) uint16 { return binary.BigEndian.Uint16(page[pageNRecs:]) }

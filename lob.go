@@ -40,6 +40,8 @@ func fetchExternal(sp *Space, ref externalRef) ([]byte, error) {
 		return fetchLOB(sp, ref)
 	case filPageTypeBlob:
 		return fetchOldBlob(sp, ref)
+	case filPageTypeZBlob, filPageTypeZBlob2:
+		return nil, fmt.Errorf("column is stored off-page in ROW_FORMAT=COMPRESSED's own BLOB format (page %d, type %d), which this tool does not read (v1 limitation)", ref.PageNo, filType(first))
 	default:
 		return nil, fmt.Errorf("page %d has type %d, neither a LOB_FIRST nor a BLOB page", ref.PageNo, filType(first))
 	}

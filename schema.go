@@ -619,7 +619,9 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 	if raw.PartitionType != 0 {
 		return nil, fmt.Errorf("partitioned tables are not supported (v1 limitation)")
 	}
-	if raw.RowFormat != rowFormatDynamic && raw.RowFormat != rowFormatCompact && raw.RowFormat != rowFormatRedundant {
+	switch raw.RowFormat {
+	case rowFormatDynamic, rowFormatCompact, rowFormatRedundant, rowFormatCompressed:
+	default:
 		return nil, fmt.Errorf("ROW_FORMAT %s is not supported (v1 limitation)", rowFormatName(raw.RowFormat))
 	}
 	isRedundant := raw.RowFormat == rowFormatRedundant
@@ -766,6 +768,10 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 	}
 
 	finishInstantSetup(t, raw, colsByOpx)
+
+	if raw.RowFormat == rowFormatCompressed && (t.HasRowVersions || t.HasOldInstantCols) {
+		return nil, fmt.Errorf("table has both ROW_FORMAT=COMPRESSED and INSTANT ADD/DROP COLUMN history, which v1 does not decode together (rare combination)")
+	}
 
 	// Secondary indexes are only ever rendered into the DDL, never walked
 	// for data (the clustered index already carries every column), so this

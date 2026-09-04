@@ -6,11 +6,11 @@
 // INSERT statement per live row, decoded by walking the clustered index's
 // B+tree directly out of the file - no server involved).
 //
-// Scope (v1): MySQL 8.0.16+ / 8.4.x tablespaces, ROW_FORMAT=DYNAMIC or
-// COMPACT, uncompressed, non-partitioned (INSTANT ADD/DROP COLUMN history is
-// supported - see instant.go). See schema.go's package comment and the
-// README for why, and BuildTable's errors for exactly which of these a given
-// file trips.
+// Scope (v1): MySQL 8.0.16+ / 8.4.x tablespaces, ROW_FORMAT=DYNAMIC,
+// COMPACT, REDUNDANT, or COMPRESSED, non-partitioned (INSTANT ADD/DROP
+// COLUMN history is supported - see instant.go). See schema.go's package
+// comment and the README for why, and BuildTable's errors for exactly which
+// of these a given file trips.
 //
 // # Copyright (C) 2026 Przemysław Malkowski
 //
@@ -42,7 +42,7 @@ import (
 
 const (
 	appName = "ibd-extractor"
-	version = "0.1.0"
+	version = "0.2.0"
 )
 
 var (

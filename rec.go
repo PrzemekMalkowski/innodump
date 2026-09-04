@@ -66,6 +66,17 @@ func recNextOffset(page []byte, recOff uint32, pageSize uint32) uint32 {
 func recIsInfimum(pageOffset uint32) bool  { return pageOffset == pageNewInfimum }
 func recIsSupremum(pageOffset uint32) bool { return pageOffset == pageNewSupremum }
 
+// recSetNextOffsNew writes recNextOffset's inverse: the signed relative
+// offset (wrapping the same way InnoDB's own uint16 arithmetic does, so no
+// separate negative-number handling is needed) that makes recOff's next
+// pointer resolve to target. Used only when reconstructing a page that was
+// never laid out on disk as bytes in the first place - a ROW_FORMAT=
+// COMPRESSED page's record chain (see zipdecompress.go), synthesized from
+// its dense directory rather than read off a physical next-pointer.
+func recSetNextOffsNew(page []byte, recOff, target uint32) {
+	binary.BigEndian.PutUint16(page[recOff-2:recOff], uint16(target-recOff))
+}
+
 // --- REDUNDANT ("old-style") record header - see redundant.go ---
 //
 // 6-byte header (page[recOff-6 : recOff]):

@@ -49,8 +49,17 @@ const (
 // sdiRoot returns the SDI index's root page number, read from the fixed
 // slot on page 0 right after the XDES array. Returns 0 if the tablespace's
 // FSP flags don't advertise SDI at all (older files / no dictionary copy).
-func sdiRoot(page0 []byte, pageSize uint32, hasSDI bool) (uint32, error) {
-	off := xdesArrOffset + xdesSize(pageSize)*(pageSize/fspExtentSize(pageSize)) + infoMaxSize
+//
+// The XDES array's own entry size/extent geometry (xdesSize, fspExtentSize)
+// is always figured in terms of the tablespace's *logical* page size, even
+// when physSize (page 0's actual, physical, on-disk size) is smaller for a
+// ROW_FORMAT=COMPRESSED tablespace - but the number of entries the array
+// holds scales with physSize, not logicalSize (cross-checked against
+// ibdNinja, which computes it the same way rather than deriving it purely
+// from first principles here). The two are the same value for an
+// uncompressed tablespace, where this reduces to what it always was.
+func sdiRoot(page0 []byte, logicalSize, physSize uint32, hasSDI bool) (uint32, error) {
+	off := xdesArrOffset + xdesSize(logicalSize)*(physSize/fspExtentSize(logicalSize)) + infoMaxSize
 	if int(off)+8 > len(page0) {
 		return 0, fmt.Errorf("SDI root pointer offset %d is beyond page 0", off)
 	}
@@ -63,7 +72,7 @@ func sdiRoot(page0 []byte, pageSize uint32, hasSDI bool) (uint32, error) {
 
 // sdiLeftmostLeaf descends from the SDI root to the leftmost leaf page.
 func sdiLeftmostLeaf(sp *Space, root uint32) (uint32, error) {
-	page, err := sp.ReadPage(root)
+	page, err := sp.ReadIndexPage(root, sdiZipShape)
 	if err != nil {
 		return 0, err
 	}
@@ -84,7 +93,7 @@ func sdiLeftmostLeaf(sp *Space, root uint32) (uint32, error) {
 			return 0, fmt.Errorf("corrupt SDI node pointer on page %d -> %d", cur, child)
 		}
 		level := pageGetLevel(page)
-		page, err = sp.ReadPage(child)
+		page, err = sp.ReadIndexPage(child, sdiZipShape)
 		if err != nil {
 			return 0, err
 		}
@@ -195,7 +204,7 @@ type sdiEnvelope struct {
 // LoadSDITables walks the whole SDI index and returns the raw dd_object
 // JSON for every dictionary object of type "Table".
 func LoadSDITables(sp *Space) ([]json.RawMessage, error) {
-	root, err := sdiRoot(sp.f0(), sp.PageSize, sp.Flags.sdi)
+	root, err := sdiRoot(sp.f0(), sp.PageSize, sp.PhysPageSize, sp.Flags.sdi)
 	if err != nil {
 		return nil, err
 	}
@@ -207,7 +216,7 @@ func LoadSDITables(sp *Space) ([]json.RawMessage, error) {
 	var tables []json.RawMessage
 	pageNo := leaf
 	for pageNo != filNull {
-		page, err := sp.ReadPage(pageNo)
+		page, err := sp.ReadIndexPage(pageNo, sdiZipShape)
 		if err != nil {
 			return nil, err
 		}

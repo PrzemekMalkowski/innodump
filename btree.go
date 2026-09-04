@@ -15,14 +15,21 @@ import (
 // is no well-defined "next page" to fall back to while still finding our way
 // down to the correct leftmost leaf.
 func leftmostLeaf(sp *Space, t *Table) (uint32, error) {
-	page, err := sp.ReadPage(t.RootPage)
+	shape := tableZipShape(t)
+	raw, err := sp.ReadPage(t.RootPage)
 	if err != nil {
 		return 0, err
 	}
 	cur := t.RootPage
-	for pageGetLevel(page) != 0 {
-		if pc := checkPage(page); !pc.OK {
+	for pageGetLevel(raw) != 0 {
+		if pc := checkPage(raw, sp.Compressed); !pc.OK {
 			return 0, fmt.Errorf("page %d (index %q, id %d): %s", cur, t.IndexName, t.IndexID, pc.Reason)
+		}
+		// Decompression (a no-op on an uncompressed tablespace) only ever
+		// runs after checkPage above has passed - see Decompress's comment.
+		page, err := sp.Decompress(raw, shape)
+		if err != nil {
+			return 0, fmt.Errorf("page %d (index %q, id %d): %s", cur, t.IndexName, t.IndexID, err)
 		}
 		compact := pageIsCompact(page)
 		var recOff uint32
@@ -42,11 +49,11 @@ func leftmostLeaf(sp *Space, t *Table) (uint32, error) {
 			return 0, fmt.Errorf("page %d: %w", cur, err)
 		}
 		level := pageGetLevel(page)
-		page, err = sp.ReadPage(child)
+		raw, err = sp.ReadPage(child)
 		if err != nil {
 			return 0, err
 		}
-		if pageGetLevel(page) != level-1 {
+		if pageGetLevel(raw) != level-1 {
 			return 0, fmt.Errorf("index is not well-formed at page %d", child)
 		}
 		cur = child
@@ -134,19 +141,27 @@ func WalkRows(sp *Space, t *Table, outCols []*Column, skipCorrupted bool, onCorr
 	if err != nil {
 		return fmt.Errorf("finding the leftmost leaf page: %w", err)
 	}
+	shape := tableZipShape(t)
 	pageNo := leaf
 	for pageNo != filNull {
-		page, err := sp.ReadPage(pageNo)
+		raw, err := sp.ReadPage(pageNo)
 		if err != nil {
 			return err
 		}
+		// Validated against the raw physical bytes throughout, exactly as
+		// for an uncompressed tablespace (see Decompress's comment):
+		// checksum, then FIL_PAGE_TYPE/index id, both readable straight off
+		// the header, which is copied verbatim into the compressed format.
 		reason := ""
-		if pc := checkPage(page); !pc.OK {
+		var page []byte
+		if pc := checkPage(raw, sp.Compressed); !pc.OK {
 			reason = pc.Reason
-		} else if filType(page) != filPageIndex {
-			reason = fmt.Sprintf("expected an INDEX page, got type %d", filType(page))
-		} else if pageGetIndexID(page) != t.IndexID {
-			reason = fmt.Sprintf("belongs to index id %d, not the expected %d", pageGetIndexID(page), t.IndexID)
+		} else if filType(raw) != filPageIndex {
+			reason = fmt.Sprintf("expected an INDEX page, got type %d", filType(raw))
+		} else if pageGetIndexID(raw) != t.IndexID {
+			reason = fmt.Sprintf("belongs to index id %d, not the expected %d", pageGetIndexID(raw), t.IndexID)
+		} else if page, err = sp.Decompress(raw, shape); err != nil {
+			reason = err.Error()
 		}
 		if reason != "" {
 			if !skipCorrupted {
@@ -155,7 +170,7 @@ func WalkRows(sp *Space, t *Table, outCols []*Column, skipCorrupted bool, onCorr
 			if onCorrupt != nil {
 				onCorrupt(CorruptPage{PageNo: pageNo, Reason: reason})
 			}
-			next := filNextPage(page)
+			next := filNextPage(raw)
 			if next == filNull || next == pageNo || next >= sp.NumPages {
 				return nil // no usable way to keep going from here
 			}

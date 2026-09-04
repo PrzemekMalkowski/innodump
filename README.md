@@ -60,7 +60,7 @@ ibd-extractor --file /path/to/table.ibd [options]
 ## Scope (v1)
 
 Supported: MySQL **8.0.16+ and 8.4.x** tablespaces, `ROW_FORMAT=DYNAMIC`,
-`COMPACT`, or `REDUNDANT`, uncompressed, non-partitioned, file-per-table
+`COMPACT`, `REDUNDANT`, or `COMPRESSED`, non-partitioned, file-per-table
 `.ibd` files — including tables with `INSTANT ADD COLUMN` / `INSTANT DROP
 COLUMN` history, both MySQL's original (8.0.12-8.0.28) mechanism and the
 row-versioning one that superseded it in 8.0.29+ (see "INSTANT ADD/DROP
@@ -72,16 +72,38 @@ so this is also what makes a 5.7-era table's `.ibd` file readable. Row
 versioning is not combined with `REDUNDANT` in practice (a table can't
 gain `INSTANT ADD/DROP COLUMN` history without also being converted off
 `REDUNDANT` first), so that specific — vanishingly rare — combination is
-detected and rejected rather than guessed at. Each of the remaining
-exclusions is checked explicitly — the tool refuses the table with a
-specific reason rather than guessing.
+detected and rejected rather than guessed at, and the same goes for
+`COMPRESSED` combined with either instant mechanism. Each of the
+remaining exclusions is checked explicitly — the tool refuses the table
+with a specific reason rather than guessing.
+
+`ROW_FORMAT=COMPRESSED` (any `KEY_BLOCK_SIZE`) is decoded by
+`zipdecompress.go`: every `FIL_PAGE_INDEX`/`FIL_PAGE_SDI` page is
+reconstructed to its full logical size before anything else in this tool
+ever sees it, in the same three passes InnoDB itself uses to read one -
+inflate the page's zlib-compressed image, replay its modification log
+(the delta patch InnoDB appends instead of recompressing on every write -
+in practice this is where *most* of a compressed page's real row content
+usually lives, not the image), then restore `DB_TRX_ID`/`DB_ROLL_PTR`,
+node pointers, and BLOB references from the page's own dedicated storage
+area. One thing this doesn't cover: a `COMPRESSED` table's off-page
+(external) column values use a different, separate on-disk format
+(`FIL_PAGE_TYPE_ZBLOB`/`ZBLOB2`) that this tool doesn't read - a row with
+one is skipped with a warning, exactly like any other row this tool can't
+decode, rather than the whole table being refused.
 
 **Not supported in v1** (all detected and reported, not silently
 mis-decoded):
 
-- `ROW_FORMAT=COMPRESSED` and page-compressed tablespaces.
 - Encrypted tablespaces.
 - Partitioned tables.
+- **MariaDB** (10.x/11.x) tablespaces, even though they're InnoDB
+  under the hood: MariaDB has no SDI. Schema lives outside the
+  tablespace file entirely (a separate `.frm`/data-dictionary file), and
+  its instant-column encoding differs from MySQL's, so reading a MariaDB
+  `.ibd` file isn't an extension of this tool's approach — it would need
+  its own schema-discovery path built from the ground up. Deliberately
+  left out of scope rather than attempted.
 - Full-text and spatial indexes are rendered into the DDL as best-effort
   `FULLTEXT KEY`/`SPATIAL KEY` clauses, but are never walked for data —
   only the clustered index is (all the data lives there regardless).
@@ -159,7 +181,11 @@ Only the `crc32` checksum algorithm is verified (the default since MySQL
 5.7 and by far the most common in practice); a tablespace still using the
 legacy `innodb_checksum_algorithm=innodb` will report false corruption —
 cross-check with `innochecksum` if `--skip-corrupted` triggers unexpectedly
-often. Compressed tablespaces are out of scope entirely (see Scope, above).
+often. A `ROW_FORMAT=COMPRESSED` page's checksum uses a different
+algorithm this tool doesn't implement, so only the cheaper "is this an
+unallocated, all-zero page" check runs for one — a genuinely corrupted
+compressed page will likely surface as a decode error instead of a clean
+"checksum mismatch" one.
 
 ## Progress
 
@@ -183,8 +209,13 @@ explicit `PRIMARY KEY`, composite-key tables, a table with `AUTO_INCREMENT`
 + secondary indexes + deleted rows, an 8.0.19 table with the old
 instant-add-only mechanism across two `ALTER TABLE ADD COLUMN`s, an
 8.0.46 table combining `ADD` and `DROP COLUMN` across five row versions,
-and `ROW_FORMAT=REDUNDANT` tables both plain and with an off-page BLOB
-column),
+`ROW_FORMAT=REDUNDANT` tables both plain and with an off-page BLOB column,
+and `ROW_FORMAT=COMPRESSED` tables at `KEY_BLOCK_SIZE=8` covering NULLs, a
+table with about half its rows deleted (exercising the free-list/dense-
+directory path), a table updated enough times in place to leave a
+non-empty modification log, and a 3,000-row/multi-page table spanning a
+non-leaf level whose root page's own content lives entirely in its
+modification log rather than its compressed image),
 reloading the generated `*-schema.sql` + `*-data.sql` into a fresh database
 and diffing every row against the original table (`SELECT * FROM orig
 EXCEPT SELECT * FROM reloaded`, both directions) came back empty.
