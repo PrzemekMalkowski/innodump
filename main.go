@@ -52,6 +52,7 @@ var (
 	limitRows     = flag.Int("limit", 0, "Stop after this many rows (0 = all)")
 	ddlOnly       = flag.Bool("ddl-only", false, "Only write the schema file; skip walking the table's data entirely")
 	skipCorrupted = flag.Bool("skip-corrupted", false, "On a corrupted leaf page, note it and try to carry on from the next page instead of stopping")
+	noProgress    = flag.Bool("no-progress", false, "Never draw the progress bar on stderr (also honored: NO_PROGRESS=1)")
 	showVersion   = flag.Bool("version", false, "Print version and exit")
 	dumpPage      = flag.Int("dump-page", -1, "debug: hex-dump one page and its record chain, then exit")
 	debug         = flag.Bool("debug", false, "debug: print each record's decoded field byte-ranges as they're read")
@@ -66,7 +67,7 @@ func main() {
 	if *filePath == "" {
 		fmt.Printf("%s %s\n", appName, version)
 		fmt.Printf("Usage: %s --file /path/to/table.ibd [--out-dir DIR] [--table NAME] [--limit N]\n", appName)
-		fmt.Println("       [--ddl-only] [--skip-corrupted] [--debug] [--dump-page N] [--version]")
+		fmt.Println("       [--ddl-only] [--skip-corrupted] [--no-progress] [--debug] [--dump-page N] [--version]")
 		os.Exit(1)
 	}
 	if err := run(); err != nil {
@@ -83,6 +84,7 @@ func run() error {
 	defer sp.Close()
 
 	debugFields = *debug
+	initProgress(*noProgress)
 	if *dumpPage >= 0 {
 		return debugDumpPage(sp, uint32(*dumpPage))
 	}
@@ -156,7 +158,15 @@ func run() error {
 			fmt.Fprintf(f, "-- skipped corrupted page %d (table %s.%s, index %q, id %d): %s\n",
 				cp.PageNo, t.SchemaRef, t.Name, t.IndexName, t.IndexID, cp.Reason)
 		}
+		// total is a rough proxy only: not every page in the file belongs to
+		// this index, so the bar may not reach 100% on a small table sharing
+		// a big tablespace, and rarely (page splits/allocation order) the
+		// leaf chain can visit a lower page number after a higher one. Either
+		// way it still gives a fair sense of progress on a large extraction.
+		pr := newProg(fmt.Sprintf("decoding %s.%s", t.SchemaRef, t.Name), int64(sp.NumPages))
+		defer pr.finish()
 		walkErr := WalkRows(sp, t, outCols, *skipCorrupted, onCorrupt, func(roe RowOrError) bool {
+			pr.set(int64(roe.PageNo))
 			if roe.Err != nil {
 				nErr++
 				fmt.Fprintf(os.Stderr, "warning: page %d rec@0x%x: %v\n", roe.PageNo, roe.RecOff, roe.Err)
@@ -170,8 +180,10 @@ func run() error {
 				}
 			}
 			nOK++
+			pr.setExtra(int64(nOK))
 			return *limitRows == 0 || nOK < *limitRows
 		})
+		pr.finish()
 		if walkErr != nil {
 			return fmt.Errorf("walking table rows: %w", walkErr)
 		}

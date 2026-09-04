@@ -52,25 +52,34 @@ ibd-extractor --file /path/to/table.ibd [options]
 | `--limit N` | Stop after N rows (0 = all). |
 | `--ddl-only` | Only write the schema file; skip walking the table's data entirely. |
 | `--skip-corrupted` | On a corrupted leaf page, note it and carry on from the next page instead of stopping. |
+| `--no-progress` | Never draw the progress bar on stderr (also honored via `NO_PROGRESS=1`). |
 | `--debug` | Print each record's decoded field byte-ranges as they're read. |
 | `--dump-page N` | Hex-dump one page and its record chain, then exit. |
 | `--version` | Print version and exit. |
 
 ## Scope (v1)
 
-Supported: MySQL **8.0.16+ and 8.4.x** tablespaces, `ROW_FORMAT=DYNAMIC` or
-`COMPACT`, uncompressed, non-partitioned, file-per-table `.ibd` files —
-including tables with `INSTANT ADD COLUMN` / `INSTANT DROP COLUMN` history,
-both MySQL's original (8.0.12-8.0.28) mechanism and the row-versioning one
-that superseded it in 8.0.29+ (see "INSTANT ADD/DROP COLUMN", below). Each
-of the remaining exclusions is checked explicitly — the tool refuses the
-table with a specific reason rather than guessing.
+Supported: MySQL **8.0.16+ and 8.4.x** tablespaces, `ROW_FORMAT=DYNAMIC`,
+`COMPACT`, or `REDUNDANT`, uncompressed, non-partitioned, file-per-table
+`.ibd` files — including tables with `INSTANT ADD COLUMN` / `INSTANT DROP
+COLUMN` history, both MySQL's original (8.0.12-8.0.28) mechanism and the
+row-versioning one that superseded it in 8.0.29+ (see "INSTANT ADD/DROP
+COLUMN", below). `ROW_FORMAT=REDUNDANT` uses the pre-5.0.3 "old-style"
+record layout (a per-field cumulative-offset array instead of a NULL
+bitmap + variable-length list), decoded by `redundant.go`; it is what a
+table created under MySQL 5.7 (and never rebuilt since) will still have,
+so this is also what makes a 5.7-era table's `.ibd` file readable. Row
+versioning is not combined with `REDUNDANT` in practice (a table can't
+gain `INSTANT ADD/DROP COLUMN` history without also being converted off
+`REDUNDANT` first), so that specific — vanishingly rare — combination is
+detected and rejected rather than guessed at. Each of the remaining
+exclusions is checked explicitly — the tool refuses the table with a
+specific reason rather than guessing.
 
 **Not supported in v1** (all detected and reported, not silently
 mis-decoded):
 
 - `ROW_FORMAT=COMPRESSED` and page-compressed tablespaces.
-- `ROW_FORMAT=REDUNDANT` (pre-5.0.3 record format).
 - Encrypted tablespaces.
 - Partitioned tables.
 - Full-text and spatial indexes are rendered into the DDL as best-effort
@@ -152,6 +161,18 @@ legacy `innodb_checksum_algorithm=innodb` will report false corruption —
 cross-check with `innochecksum` if `--skip-corrupted` triggers unexpectedly
 often. Compressed tablespaces are out of scope entirely (see Scope, above).
 
+## Progress
+
+When stderr is a real terminal, a spinner shows on it once an extraction
+has been running long enough to be worth the flicker (fast runs finish
+before it ever appears) — a percentage bar keyed off the tablespace's page
+count, a running row count, and elapsed time. It's a rough proxy only: not
+every page in the file belongs to the table being extracted, so the bar
+may not reach 100% on a small table sharing a big tablespace, and it never
+touches stdout or the output files either way. Pass `--no-progress` (or
+set `NO_PROGRESS=1`) to suppress it, e.g. when running under something
+that doesn't want carriage-return redraws in its log capture.
+
 ## Validation
 
 This was cross-checked end to end against real MySQL 8.0.19, 8.0.46, and
@@ -160,8 +181,10 @@ including `DECIMAL`/`BIT`/`ENUM`/`SET`/`JSON`/all temporal types, off-page
 BLOB/TEXT values up to 32 KB spanning multiple LOB pages, tables with no
 explicit `PRIMARY KEY`, composite-key tables, a table with `AUTO_INCREMENT`
 + secondary indexes + deleted rows, an 8.0.19 table with the old
-instant-add-only mechanism across two `ALTER TABLE ADD COLUMN`s, and an
-8.0.46 table combining `ADD` and `DROP COLUMN` across five row versions),
+instant-add-only mechanism across two `ALTER TABLE ADD COLUMN`s, an
+8.0.46 table combining `ADD` and `DROP COLUMN` across five row versions,
+and `ROW_FORMAT=REDUNDANT` tables both plain and with an off-page BLOB
+column),
 reloading the generated `*-schema.sql` + `*-data.sql` into a fresh database
 and diffing every row against the original table (`SELECT * FROM orig
 EXCEPT SELECT * FROM reloaded`, both directions) came back empty.
