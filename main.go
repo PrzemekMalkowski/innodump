@@ -11,7 +11,7 @@
 // COLUMN history. See schema.go's package comment and the README for why,
 // and BuildTable's errors for exactly which of these a given file trips.
 //
-// Copyright (C) 2026 Przemysław Malkowski
+// # Copyright (C) 2026 Przemysław Malkowski
 //
 // This program is free software: you can redistribute it and/or modify
 // it under the terms of the GNU General Public License as published by
