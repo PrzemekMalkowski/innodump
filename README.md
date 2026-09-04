@@ -53,6 +53,7 @@ ibd-extractor --file /path/to/table.ibd [options]
 | `--ddl-only` | Only write the schema file; skip walking the table's data entirely. |
 | `--skip-corrupted` | On a corrupted leaf page, note it and carry on from the next page instead of stopping. |
 | `--no-progress` | Never draw the progress bar on stderr (also honored via `NO_PROGRESS=1`). |
+| `--verbose` | Print extra file/table details: page size, FSP flags, the MySQL version and dictionary/SDI versions that wrote the file, and index/column counts. |
 | `--debug` | Print each record's decoded field byte-ranges as they're read. |
 | `--dump-page N` | Hex-dump one page and its record chain, then exit. |
 | `--version` | Print version and exit. |

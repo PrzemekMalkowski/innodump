@@ -197,31 +197,47 @@ func sdiParseRecord(sp *Space, page []byte, recOff uint32) (*sdiRow, error) {
 
 // sdiEnvelope is the outer wrapper MySQL puts around every SDI JSON object.
 type sdiEnvelope struct {
-	DDObjectType string          `json:"dd_object_type"`
-	DDObject     json.RawMessage `json:"dd_object"`
+	MySQLVersionID uint32          `json:"mysqld_version_id"`
+	DDVersion      uint32          `json:"dd_version"`
+	SDIVersion     uint32          `json:"sdi_version"`
+	DDObjectType   string          `json:"dd_object_type"`
+	DDObject       json.RawMessage `json:"dd_object"`
+}
+
+// SDIInfo summarizes the tablespace's own dictionary metadata, independent
+// of any one table - the same for every row in the SDI index, so this is
+// filled in from whichever one LoadSDITables happens to read first. Used
+// only for --verbose output (main.go).
+type SDIInfo struct {
+	MySQLVersionID uint32
+	DDVersion      uint32
+	SDIVersion     uint32
 }
 
 // LoadSDITables walks the whole SDI index and returns the raw dd_object
-// JSON for every dictionary object of type "Table".
-func LoadSDITables(sp *Space) ([]json.RawMessage, error) {
+// JSON for every dictionary object of type "Table", plus a summary of the
+// tablespace's own dictionary metadata (see SDIInfo).
+func LoadSDITables(sp *Space) ([]json.RawMessage, SDIInfo, error) {
+	var info SDIInfo
 	root, err := sdiRoot(sp.f0(), sp.PageSize, sp.PhysPageSize, sp.Flags.sdi)
 	if err != nil {
-		return nil, err
+		return nil, info, err
 	}
 	leaf, err := sdiLeftmostLeaf(sp, root)
 	if err != nil {
-		return nil, err
+		return nil, info, err
 	}
 
 	var tables []json.RawMessage
+	haveInfo := false
 	pageNo := leaf
 	for pageNo != filNull {
 		page, err := sp.ReadIndexPage(pageNo, sdiZipShape)
 		if err != nil {
-			return nil, err
+			return nil, info, err
 		}
 		if filType(page) != filPageSDI {
-			return nil, fmt.Errorf("expected SDI page at %d, got type %d", pageNo, filType(page))
+			return nil, info, fmt.Errorf("expected SDI page at %d, got type %d", pageNo, filType(page))
 		}
 		var walkErr error
 		walkRecords(page, sp.PageSize, func(recOff uint32) bool {
@@ -238,17 +254,21 @@ func LoadSDITables(sp *Space) ([]json.RawMessage, error) {
 				walkErr = fmt.Errorf("parsing SDI JSON: %w", err)
 				return false
 			}
+			if !haveInfo {
+				info = SDIInfo{MySQLVersionID: env.MySQLVersionID, DDVersion: env.DDVersion, SDIVersion: env.SDIVersion}
+				haveInfo = true
+			}
 			if env.DDObjectType == "Table" {
 				tables = append(tables, env.DDObject)
 			}
 			return true
 		})
 		if walkErr != nil {
-			return nil, walkErr
+			return nil, info, walkErr
 		}
 		pageNo = filNextPage(page)
 	}
-	return tables, nil
+	return tables, info, nil
 }
 
 // f0 reads and caches page 0 (used by both sdiRoot and the caller that

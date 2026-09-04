@@ -53,6 +53,7 @@ var (
 	ddlOnly       = flag.Bool("ddl-only", false, "Only write the schema file; skip walking the table's data entirely")
 	skipCorrupted = flag.Bool("skip-corrupted", false, "On a corrupted leaf page, note it and try to carry on from the next page instead of stopping")
 	noProgress    = flag.Bool("no-progress", false, "Never draw the progress bar on stderr (also honored: NO_PROGRESS=1)")
+	verbose       = flag.Bool("verbose", false, "Print extra .ibd/table details: page size, FSP flags, the MySQL version and dictionary/SDI versions that wrote the file, index/column counts")
 	showVersion   = flag.Bool("version", false, "Print version and exit")
 	dumpPage      = flag.Int("dump-page", -1, "debug: hex-dump one page and its record chain, then exit")
 	debug         = flag.Bool("debug", false, "debug: print each record's decoded field byte-ranges as they're read")
@@ -67,7 +68,7 @@ func main() {
 	if *filePath == "" {
 		fmt.Printf("%s %s\n", appName, version)
 		fmt.Printf("Usage: %s --file /path/to/table.ibd [--out-dir DIR] [--table NAME] [--limit N]\n", appName)
-		fmt.Println("       [--ddl-only] [--skip-corrupted] [--no-progress] [--debug] [--dump-page N] [--version]")
+		fmt.Println("       [--ddl-only] [--skip-corrupted] [--no-progress] [--verbose] [--debug] [--dump-page N] [--version]")
 		os.Exit(1)
 	}
 	if err := run(); err != nil {
@@ -85,16 +86,24 @@ func run() error {
 
 	debugFields = *debug
 	initProgress(*noProgress)
+	if *verbose {
+		printSpaceInfo(sp, *filePath)
+	}
 	if *dumpPage >= 0 {
 		return debugDumpPage(sp, uint32(*dumpPage))
 	}
 
-	rawTables, err := LoadSDITables(sp)
+	rawTables, sdiInfo, err := LoadSDITables(sp)
 	if err != nil {
 		return fmt.Errorf("reading SDI: %w", err)
 	}
 	if len(rawTables) == 0 {
 		return fmt.Errorf("no table definitions found in this tablespace's SDI")
+	}
+	if *verbose {
+		fmt.Printf("SDI:         present (written by MySQL %s, dd_version %d, sdi_version %d)\n",
+			formatMySQLVersion(sdiInfo.MySQLVersionID), sdiInfo.DDVersion, sdiInfo.SDIVersion)
+		fmt.Printf("Tables in SDI: %d\n", len(rawTables))
 	}
 
 	var parsed []*ddTableJSON
@@ -114,6 +123,12 @@ func run() error {
 	t, err := BuildTable(target)
 	if err != nil {
 		return fmt.Errorf("table %q: %w", target.Name, err)
+	}
+	if *verbose {
+		fmt.Printf("Row format:  %s\n", rowFormatName(t.RowFormat))
+		fmt.Printf("Clustered index: %q (id %d), root page %d\n", t.IndexName, t.IndexID, t.RootPage)
+		fmt.Printf("Secondary indexes: %d\n", len(t.SecondaryIndexes))
+		fmt.Printf("Physical fields: %d (%d output)\n", len(t.PhysicalFields), len(OutputColumns(t)))
 	}
 
 	base := strings.TrimSuffix(filepath.Base(*filePath), filepath.Ext(*filePath))
@@ -222,6 +237,39 @@ func run() error {
 // pickTable chooses which SDI table entry to extract when a tablespace's
 // SDI (unusually) holds more than one, preferring an exact name match
 // against --table or the .ibd file's own base name.
+// printSpaceInfo prints --verbose's file/tablespace-level details: the
+// stuff readable straight from the FSP header on page 0, before any
+// SDI/dictionary parsing has happened (so it's useful even when that part
+// fails or the file predates SDI entirely).
+func printSpaceInfo(sp *Space, path string) {
+	fi, err := os.Stat(path)
+	size := int64(-1)
+	if err == nil {
+		size = fi.Size()
+	}
+	fmt.Printf("File:        %s (%d bytes)\n", path, size)
+	fmt.Printf("Space ID:    %d\n", sp.SpaceID)
+	fmt.Printf("Pages:       %d\n", sp.NumPages)
+	if sp.Compressed {
+		fmt.Printf("Page size:   %d bytes physical (KEY_BLOCK_SIZE=%d), %d bytes logical\n",
+			sp.PhysPageSize, sp.PhysPageSize/1024, sp.PageSize)
+	} else {
+		fmt.Printf("Page size:   %d bytes\n", sp.PageSize)
+	}
+	f := sp.Flags
+	fmt.Printf("FSP flags:   0x%08x (post_antelope=%v atomic_blobs=%v data_dir=%v shared=%v temporary=%v encryption=%v sdi=%v)\n",
+		f.raw, f.postAntelope, f.atomicBlobs, f.dataDir, f.shared, f.temporary, f.encryption, f.sdi)
+}
+
+// formatMySQLVersion renders a dd_object's numeric mysqld_version_id
+// (MMmmpp, e.g. 80046) the way MySQL itself reports it (e.g. "8.0.46").
+func formatMySQLVersion(id uint32) string {
+	if id == 0 {
+		return "unknown"
+	}
+	return fmt.Sprintf("%d.%d.%d", id/10000, (id/100)%100, id%100)
+}
+
 func pickTable(tables []*ddTableJSON, ibdPath, want string) (*ddTableJSON, error) {
 	if len(tables) == 1 && want == "" {
 		return tables[0], nil
