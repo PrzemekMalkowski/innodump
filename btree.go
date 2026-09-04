@@ -184,11 +184,23 @@ func decodeOneRow(sp *Space, page []byte, recOff uint32, t *Table, outCols []*Co
 		if !ok {
 			return nil, fmt.Errorf("column %q is not in the clustered index's physical layout", col.Name)
 		}
-		if fr.Null {
-			values[i] = "NULL"
-			continue
+		if fr.Dropped {
+			// An output column is never one this table's SDI marks
+			// IsColumnDropped, so this would mean the physical layout and
+			// the per-record instant/version decode disagree - a bug, not
+			// user-facing corruption, so it's worth a specific message.
+			return nil, fmt.Errorf("column %q resolved to dropped for this row, but is not itself a dropped column", col.Name)
 		}
-		v, err := decodeField(sp, col, page, fr)
+		var v string
+		var err error
+		switch {
+		case fr.Null:
+			v = "NULL"
+		case fr.Default:
+			v, err = decodeInstantDefault(col)
+		default:
+			v, err = decodeField(sp, col, page, fr)
+		}
 		if err != nil {
 			return nil, err
 		}

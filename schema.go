@@ -11,21 +11,35 @@
 //	  (or, if the table has no explicit PK: [DB_ROW_ID])
 //	+ [DB_TRX_ID] + [DB_ROLL_PTR]
 //	+ [every remaining non-virtual, non-SE-hidden column, in CREATE TABLE order]
+//	+ [instant-dropped columns, if any]
 //
-// v1 does not support tables whose columns carry INSTANT ADD/DROP COLUMN
-// history (detected via the "version_added"/"version_dropped"/"instant_col"
-// se_private_data markers): the physical layout and NULL-bitmap size then
-// depend on which schema version a given *row* was inserted under, which
-// needs a lot more machinery (see Record::GetInsertState in ibdNinja) than
-// a first prototype warrants. Such tables are reported, not mis-decoded.
+// That's the construction order; for a table with row versioning (detected
+// via any column's "physical_pos" se_private_data marker) the fields are
+// then re-sorted by physical_pos, which is what InnoDB actually uses once a
+// table's ever had an INSTANT DROP COLUMN - see instant.go for how a given
+// record's row version decides which of these fields it actually has.
 package main
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 )
+
+// parseUintDefault parses an se_private_data value, returning def on any
+// error (these values are small integers written by the server itself; a
+// parse failure means a corrupt/unexpected SDI, not a value worth failing
+// the whole extraction over).
+func parseUintDefault(s string, def uint64) uint64 {
+	v, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return def
+	}
+	return v
+}
 
 // enum_column_types (Column.h in the DD; values are part of the on-disk SDI
 // format, not implementation detail, so hard-coding them here is safe).
@@ -208,6 +222,19 @@ type Column struct {
 	ColLen   uint32 // storage byte length (pack length)
 	FixedLen uint32 // 0 => variable-length in the record
 	IsSystem bool   // DB_ROW_ID / DB_TRX_ID / DB_ROLL_PTR
+
+	// INSTANT ADD/DROP COLUMN bookkeeping (see instant.go). HasVersionAdded/
+	// HasVersionDropped mirror Column::IsColumnAdded/IsColumnDropped - whether
+	// the SDI's se_private_data carried that key at all, not whether the
+	// value is nonzero.
+	HasVersionAdded      bool
+	VersionAdded         uint8
+	HasVersionDropped    bool
+	VersionDropped       uint8
+	HasPhysPos           bool
+	PhysPos              uint32
+	InstantDefaultIsNull bool   // se_private_data had "default_null"
+	InstantDefault       []byte // decoded from se_private_data "default=<hex>"; nil if none recorded
 }
 
 func (c *Column) IsBinary() bool { return c.CollationID == 63 } // my_charset_bin
@@ -216,6 +243,25 @@ func (c *Column) IsBinary() bool { return c.CollationID == 63 } // my_charset_bi
 // need the 2-byte/external encoding.
 func (c *Column) isBigCol() bool {
 	return c.ColLen > 255 || c.Mtype == dataBlob || c.Mtype == dataVarPoint || c.Mtype == dataGeometry
+}
+
+// IsColumnDropped/IsColumnAdded mirror Column::IsColumnDropped/IsColumnAdded.
+func (c *Column) IsColumnDropped() bool { return c.HasVersionDropped }
+func (c *Column) IsColumnAdded() bool   { return c.HasVersionAdded }
+
+// IsInstantAdded/IsInstantDropped mirror Column::IsInstantAdded/IsInstantDropped:
+// version 0 doesn't count (it's used as a placeholder, not a real ALTER).
+func (c *Column) IsInstantAdded() bool   { return c.HasVersionAdded && c.VersionAdded > 0 }
+func (c *Column) IsInstantDropped() bool { return c.HasVersionDropped && c.VersionDropped > 0 }
+
+// IsDroppedInOrBefore/IsAddedAfter mirror the same-named Column methods: given
+// the row version a *record* was written under, do they make this column
+// absent (dropped already) or not-yet-existing (added later) for that record?
+func (c *Column) IsDroppedInOrBefore(v uint8) bool {
+	return c.IsInstantDropped() && c.VersionDropped <= v
+}
+func (c *Column) IsAddedAfter(v uint8) bool {
+	return c.IsInstantAdded() && c.VersionAdded > v
 }
 
 type IndexField struct {
@@ -256,7 +302,18 @@ type Table struct {
 	HasExplicitPK  bool
 	PKFields       []*IndexField
 	PhysicalFields []*IndexField // full clustered-index row layout, in order
-	NNullable      int
+	NNullable      int           // nullable count across PhysicalFields (plain/no-instant tables only)
+
+	// INSTANT ADD/DROP COLUMN (see instant.go). A table is in at most one of
+	// these two states (MySQL 8.0.29+ row-versioning supersedes the older
+	// 8.0.12-8.0.28 mechanism the first time a table gets a *new*-style
+	// instant operation after upgrading), never both.
+	HasRowVersions    bool
+	CurrentRowVersion uint8
+	NullableInVersion []int // index 0..CurrentRowVersion; ib_nullables_ equivalent
+
+	HasOldInstantCols   bool
+	OldNonDefaultFields int // physical field count of a row predating any instant add
 
 	SecondaryIndexes []*SecondaryIndex
 
@@ -498,6 +555,26 @@ func buildColumn(raw ddColumnJSON) (*Column, error) {
 		DefaultText:     raw.DefaultValueUtf8,
 		IsSystem:        isSystem,
 	}
+	sep := sePropString(raw.SePrivateData)
+	if v, ok := sep["version_added"]; ok {
+		c.HasVersionAdded = true
+		c.VersionAdded = uint8(parseUintDefault(v, 0))
+	}
+	if v, ok := sep["version_dropped"]; ok {
+		c.HasVersionDropped = true
+		c.VersionDropped = uint8(parseUintDefault(v, 0))
+	}
+	if v, ok := sep["physical_pos"]; ok {
+		c.HasPhysPos = true
+		c.PhysPos = uint32(parseUintDefault(v, 0))
+	}
+	if _, ok := sep["default_null"]; ok {
+		c.InstantDefaultIsNull = true
+	} else if v, ok := sep["default"]; ok {
+		if b, err := hex.DecodeString(v); err == nil {
+			c.InstantDefault = b
+		}
+	}
 	if isSystem {
 		c.Mtype = dataSys
 		c.ColLen = pl
@@ -528,19 +605,11 @@ func buildColumn(raw ddColumnJSON) (*Column, error) {
 	return c, nil
 }
 
-// hasInstantHistory reports whether the raw column carries any
-// instant-ADD/DROP-COLUMN or row-versioning marker.
-func hasInstantHistory(sep string) bool {
-	p := sePropString(sep)
-	_, added := p["version_added"]
-	_, dropped := p["version_dropped"]
-	return added || dropped
-}
-
 // BuildTable resolves a raw SDI dd_object into the model record.go and
 // btree.go need, or returns a descriptive error for a v1-unsupported table
-// (compressed/redundant row format, partitioning, or instant ADD/DROP
-// COLUMN history).
+// (compressed/redundant row format or partitioning). INSTANT ADD/DROP COLUMN
+// history (either MySQL's 8.0.12-8.0.28 mechanism or the 8.0.29+ row
+// -versioning one that superseded it) is supported - see instant.go.
 func BuildTable(raw *ddTableJSON) (*Table, error) {
 	if raw.PartitionType != 0 {
 		return nil, fmt.Errorf("partitioned tables are not supported (v1 limitation)")
@@ -548,15 +617,9 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 	if raw.RowFormat != rowFormatDynamic && raw.RowFormat != rowFormatCompact {
 		return nil, fmt.Errorf("ROW_FORMAT %s is not supported; only DYNAMIC and COMPACT are (v1 limitation)", rowFormatName(raw.RowFormat))
 	}
-	if p := sePropString(raw.SePrivateData); p["instant_col"] != "" {
-		return nil, fmt.Errorf("table has INSTANT ADD/DROP COLUMN history, which v1 does not decode (see limitations)")
-	}
 
 	colsByOpx := make([]*Column, len(raw.Columns)) // original SDI array order
 	for i, rc := range raw.Columns {
-		if hasInstantHistory(rc.SePrivateData) {
-			return nil, fmt.Errorf("column %q has INSTANT ADD/DROP COLUMN history, which v1 does not decode (see limitations)", rc.Name)
-		}
 		c, err := buildColumn(rc)
 		if err != nil {
 			return nil, err
@@ -656,11 +719,35 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 	addSys(trxIDCol)
 	addSys(rollPtrCol)
 	for _, c := range colsByOpx {
-		if c.IsSystem || c.IsVirtual || c.Hidden == hiddenSE || placed[c] {
+		// An instant-dropped column is SE-hidden (its DD name even gets a
+		// "!hidden!_dropped_v<N>_p<M>_<original>" prefix) but still occupied
+		// physical space in rows written before it was dropped, so - unlike
+		// other SE-hidden columns - it belongs in the physical layout.
+		if c.IsSystem || c.IsVirtual || placed[c] {
+			continue
+		}
+		if c.Hidden == hiddenSE && !c.IsColumnDropped() {
 			continue
 		}
 		fields = append(fields, &IndexField{Col: c, EffFixedLen: c.FixedLen})
 		placed[c] = true
+	}
+
+	// Row versioning (MySQL 8.0.29+) assigns every field a fixed, permanent
+	// "physical_pos" slot that survives later drops (so a dropped column's
+	// slot is never reused) - the construction order above only matters for
+	// tables that never had row versioning, where fields are laid out in
+	// straightforward append order. See instant.go for how records use this.
+	for _, c := range colsByOpx {
+		if !c.IsVirtual && c.HasPhysPos {
+			t.HasRowVersions = true
+			break
+		}
+	}
+	if t.HasRowVersions {
+		sort.SliceStable(fields, func(i, j int) bool {
+			return fields[i].Col.PhysPos < fields[j].Col.PhysPos
+		})
 	}
 	t.PhysicalFields = fields
 	for _, f := range fields {
@@ -668,6 +755,8 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 			t.NNullable++
 		}
 	}
+
+	finishInstantSetup(t, raw, colsByOpx)
 
 	// Secondary indexes are only ever rendered into the DDL, never walked
 	// for data (the clustered index already carries every column), so this

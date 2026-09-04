@@ -7,9 +7,10 @@
 // B+tree directly out of the file - no server involved).
 //
 // Scope (v1): MySQL 8.0.16+ / 8.4.x tablespaces, ROW_FORMAT=DYNAMIC or
-// COMPACT, uncompressed, non-partitioned, and without INSTANT ADD/DROP
-// COLUMN history. See schema.go's package comment and the README for why,
-// and BuildTable's errors for exactly which of these a given file trips.
+// COMPACT, uncompressed, non-partitioned (INSTANT ADD/DROP COLUMN history is
+// supported - see instant.go). See schema.go's package comment and the
+// README for why, and BuildTable's errors for exactly which of these a given
+// file trips.
 //
 // # Copyright (C) 2026 Przemysław Malkowski
 //

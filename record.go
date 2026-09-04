@@ -21,23 +21,54 @@ import (
 )
 
 // fieldRange describes where one physical field's bytes sit within a
-// record, or that it is NULL/absent.
+// record, or that it is NULL/absent/not-applicable-to-this-row (Default,
+// Dropped: see instant.go).
 type fieldRange struct {
 	Start, End uint32 // byte offsets within the page, valid only if !Null
 	Null       bool
 	External   bool // the last 20 bytes of [Start,End) are a BTR_EXTERN reference
+	Default    bool // column didn't exist yet when this row was written; use its instant default
+	Dropped    bool // column was already instant-dropped by the time this row was written
 }
 
 // decodeRecordFields returns one fieldRange per entry in t.PhysicalFields,
-// for the ordinary (REC_STATUS_ORDINARY) leaf record at recOff on page.
+// for the ordinary (REC_STATUS_ORDINARY) leaf record at recOff on page. It
+// dispatches on the record's own info-bit flags and the table's INSTANT ADD/
+// DROP COLUMN state - see instant.go's package comment for the four
+// resulting cases (this mirrors Record::GetInsertState in ibdNinja).
 func decodeRecordFields(page []byte, recOff uint32, t *Table) ([]fieldRange, error) {
 	if recStatus(page, recOff) != recStatusOrdinary {
 		return nil, fmt.Errorf("not an ordinary record (status=%d)", recStatus(page, recOff))
 	}
-	if recInfoBits(page, recOff)&(recInfoInstantFlag|recInfoVersionFlag) != 0 {
-		return nil, fmt.Errorf("record uses the instant-ADD/row-versioning header format, which v1 does not decode")
+	info := recInfoBits(page, recOff)
+	isVersioned := info&recInfoVersionFlag != 0
+	isInstant := info&recInfoInstantFlag != 0
+
+	switch {
+	case isVersioned:
+		if !t.HasRowVersions && !t.HasOldInstantCols {
+			return nil, fmt.Errorf("record has the row-version header flag set, but the table's SDI shows no instant/row-version history (corrupt?)")
+		}
+		return decodeFieldRangesVersioned(page, recOff, t, page[recOff-6], 1)
+	case isInstant:
+		if !t.HasOldInstantCols {
+			return nil, fmt.Errorf("record has the legacy instant-add header flag set, but the table's SDI shows no such history (corrupt?)")
+		}
+		n, length, err := readOldInstantFieldCount(page, recOff)
+		if err != nil {
+			return nil, err
+		}
+		return decodeFieldRangesOldInstant(page, recOff, t, n, uint32(length))
+	case t.HasRowVersions:
+		// Predates row versioning entirely (no version byte was ever written
+		// for it) - treat as if written at version 0.
+		return decodeFieldRangesVersioned(page, recOff, t, 0, 0)
+	case t.HasOldInstantCols:
+		// Predates the table's first-ever instant add.
+		return decodeFieldRangesOldInstant(page, recOff, t, t.OldNonDefaultFields, 0)
+	default:
+		return decodeFieldRanges(page, recOff, t.PhysicalFields, t.NNullable)
 	}
-	return decodeFieldRanges(page, recOff, t.PhysicalFields, t.NNullable)
 }
 
 // decodeFieldRanges is the shared implementation of InnoDB's
@@ -45,10 +76,27 @@ func decodeRecordFields(page []byte, recOff uint32, t *Table) ([]fieldRange, err
 // record: it walks the NULL bitmap and variable-length list once, in
 // physical field order, and returns each field's byte range. Used both for
 // leaf (row) records and, with a restricted field list, for non-leaf
-// (node-pointer) records - see btree.go's nonLeafChildPage.
+// (node-pointer) records - see btree.go's nonLeafChildPage - and as the
+// inner loop of the INSTANT ADD/DROP-aware decoders in instant.go.
 func decodeFieldRanges(page []byte, recOff uint32, fields []*IndexField, nNullable int) ([]fieldRange, error) {
+	return decodeFieldRangesSpecial(page, recOff, 0, fields, nNullable, nil)
+}
+
+// decodeFieldRangesSpecial is decodeFieldRanges with a per-field hook
+// consulted BEFORE the null-bit/length-list decode, for INSTANT ADD/DROP
+// COLUMN handling: InnoDB's rec_init_offsets_comp_ordinary resolves a
+// dropped-or-not-yet-added field before ever touching the NULL bitmap or
+// variable-length list for it, since such a field consumes zero bytes and no
+// NULL bit at all (special returning ok=true skips both entirely).
+//
+// headerExtra is the count of extra bytes an instant/versioned record
+// carries between the 5-byte header and the NULL bitmap (the row version
+// byte, or the old mechanism's 1-2 byte field count) - the NULL bitmap and
+// variable-length list both start that much further back than usual.
+func decodeFieldRangesSpecial(page []byte, recOff uint32, headerExtra uint32, fields []*IndexField, nNullable int,
+	special func(i int, col *Column) (fieldRange, bool)) ([]fieldRange, error) {
 	nullBytes := (nNullable + 7) / 8
-	nullsEnd := recOff - 5 // one past the last (rightmost) null-bitmap byte
+	nullsEnd := recOff - 5 - headerExtra // one past the last (rightmost) null-bitmap byte
 	lensEnd := nullsEnd - uint32(nullBytes)
 
 	nullPos := 0 // index of the next nullable column to consult
@@ -72,6 +120,13 @@ func decodeFieldRanges(page []byte, recOff uint32, fields []*IndexField, nNullab
 	}
 	for i, f := range fields {
 		col := f.Col
+		if special != nil {
+			if fr, ok := special(i, col); ok {
+				fr.Start, fr.End = offs, offs
+				out[i] = fr
+				continue
+			}
+		}
 		if col.IsNullable {
 			if null() {
 				out[i] = fieldRange{Null: true, Start: offs, End: offs}
@@ -101,7 +156,8 @@ func decodeFieldRanges(page []byte, recOff uint32, fields []*IndexField, nNullab
 	}
 	if debugFields {
 		for i, r := range out {
-			fmt.Printf("  field %d %q: [0x%x,0x%x) null=%v ext=%v\n", i, fields[i].Col.Name, r.Start, r.End, r.Null, r.External)
+			fmt.Printf("  field %d %q: [0x%x,0x%x) null=%v ext=%v default=%v dropped=%v\n",
+				i, fields[i].Col.Name, r.Start, r.End, r.Null, r.External, r.Default, r.Dropped)
 		}
 	}
 	return out, nil

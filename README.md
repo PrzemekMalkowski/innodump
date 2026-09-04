@@ -59,10 +59,12 @@ ibd-extractor --file /path/to/table.ibd [options]
 ## Scope (v1)
 
 Supported: MySQL **8.0.16+ and 8.4.x** tablespaces, `ROW_FORMAT=DYNAMIC` or
-`COMPACT`, uncompressed, non-partitioned, file-per-table `.ibd` files whose
-columns have never been through an `INSTANT ADD/DROP COLUMN` (each of these
-is checked explicitly — the tool refuses the table with a specific reason
-rather than guessing).
+`COMPACT`, uncompressed, non-partitioned, file-per-table `.ibd` files —
+including tables with `INSTANT ADD COLUMN` / `INSTANT DROP COLUMN` history,
+both MySQL's original (8.0.12-8.0.28) mechanism and the row-versioning one
+that superseded it in 8.0.29+ (see "INSTANT ADD/DROP COLUMN", below). Each
+of the remaining exclusions is checked explicitly — the tool refuses the
+table with a specific reason rather than guessing.
 
 **Not supported in v1** (all detected and reported, not silently
 mis-decoded):
@@ -71,14 +73,23 @@ mis-decoded):
 - `ROW_FORMAT=REDUNDANT` (pre-5.0.3 record format).
 - Encrypted tablespaces.
 - Partitioned tables.
-- Tables with `INSTANT ADD COLUMN` / `INSTANT DROP COLUMN` history (MySQL
-  8.0.12+). This is common in practice for long-lived tables that have had
-  `ALTER TABLE ... ADD COLUMN` run on them — a v2 goal is to support it
-  (see `schema.go` and `record.go`'s package comments for exactly what
-  additional bookkeeping that needs).
 - Full-text and spatial indexes are rendered into the DDL as best-effort
   `FULLTEXT KEY`/`SPATIAL KEY` clauses, but are never walked for data —
   only the clustered index is (all the data lives there regardless).
+
+## INSTANT ADD/DROP COLUMN
+
+A row's physical layout depends on which schema version it was written
+under — a row inserted before a later `ADD COLUMN` simply doesn't have that
+column's bytes at all, and one written before a later `DROP COLUMN` still
+does. Each record's header carries enough information (see `instant.go`) to
+work out, field by field, whether it's genuinely present, not yet added (use
+the column's recorded instant default, or `NULL`), or already dropped
+(entirely absent, contributing no bytes and no NULL-bitmap bit) — mirroring
+`Record::GetInsertState`/`InitColumnOffsetsCompactLeaf` in `ibdNinja`.
+
+A dropped column is naturally excluded from both the generated `CREATE
+TABLE` and every `INSERT`, exactly as `SELECT *` on the live table would be.
 - Pre-8.0 tablespaces (no embedded SDI to read at all).
 
 ## Output notes
@@ -143,15 +154,17 @@ often. Compressed tablespaces are out of scope entirely (see Scope, above).
 
 ## Validation
 
-This was cross-checked end to end against real MySQL 8.0.46 and 8.4.11
-servers: for every test table (plain types, every scalar type including
-`DECIMAL`/`BIT`/`ENUM`/`SET`/`JSON`/all temporal types, off-page
+This was cross-checked end to end against real MySQL 8.0.19, 8.0.46, and
+8.4.11 servers: for every test table (plain types, every scalar type
+including `DECIMAL`/`BIT`/`ENUM`/`SET`/`JSON`/all temporal types, off-page
 BLOB/TEXT values up to 32 KB spanning multiple LOB pages, tables with no
-explicit `PRIMARY KEY`, composite-key tables, and a table with
-`AUTO_INCREMENT` + secondary indexes + deleted rows), reloading the
-generated `*-schema.sql` + `*-data.sql` into a fresh database and diffing
-every row against the original table (`SELECT * FROM orig EXCEPT SELECT *
-FROM reloaded`, both directions) came back empty.
+explicit `PRIMARY KEY`, composite-key tables, a table with `AUTO_INCREMENT`
++ secondary indexes + deleted rows, an 8.0.19 table with the old
+instant-add-only mechanism across two `ALTER TABLE ADD COLUMN`s, and an
+8.0.46 table combining `ADD` and `DROP COLUMN` across five row versions),
+reloading the generated `*-schema.sql` + `*-data.sql` into a fresh database
+and diffing every row against the original table (`SELECT * FROM orig
+EXCEPT SELECT * FROM reloaded`, both directions) came back empty.
 
 Corruption handling was validated by flipping a byte in a real leaf page of
 a 2,000-row, 72-leaf-page table: the default run stopped with the exact
