@@ -1,16 +1,18 @@
-// ibd-extractor - offline schema+data extraction from a MySQL 8.0/8.4
-// InnoDB .ibd file.
+// ibd-extractor - offline schema+data extraction from a MySQL 8.0/8.4, or
+// 5.6/5.7, InnoDB .ibd file.
 //
 // Given table.ibd, produces table-schema.sql (a best-effort CREATE TABLE,
-// reconstructed from the tablespace's embedded SDI) and table-data.sql (one
-// INSERT statement per live row, decoded by walking the clustered index's
-// B+tree directly out of the file - no server involved).
+// reconstructed from the tablespace's embedded SDI, or its .frm file for a
+// pre-8.0 table - see frm.go) and table-data.sql (one INSERT statement per
+// live row, decoded by walking the clustered index's B+tree directly out
+// of the file - no server involved).
 //
 // Scope (v1): MySQL 8.0.16+ / 8.4.x tablespaces, ROW_FORMAT=DYNAMIC,
 // COMPACT, REDUNDANT, or COMPRESSED, non-partitioned (INSTANT ADD/DROP
-// COLUMN history is supported - see instant.go). See schema.go's package
-// comment and the README for why, and BuildTable's errors for exactly which
-// of these a given file trips.
+// COLUMN history is supported - see instant.go), plus MySQL 5.6/5.7 given
+// the table's .frm file alongside it. See schema.go's and frm.go's package
+// comments and the README for why, and BuildTable's errors for exactly
+// which of these a given file trips.
 //
 // # Copyright (C) 2026 Przemysław Malkowski
 //
@@ -42,7 +44,7 @@ import (
 
 const (
 	appName = "ibd-extractor"
-	version = "0.2.0"
+	version = "0.3.0"
 )
 
 var (
@@ -93,31 +95,48 @@ func run() error {
 		return debugDumpPage(sp, uint32(*dumpPage))
 	}
 
-	rawTables, sdiInfo, err := LoadSDITables(sp)
-	if err != nil {
-		return fmt.Errorf("reading SDI: %w", err)
-	}
-	if len(rawTables) == 0 {
-		return fmt.Errorf("no table definitions found in this tablespace's SDI")
-	}
-	if *verbose {
-		fmt.Printf("SDI:         present (written by MySQL %s, dd_version %d, sdi_version %d)\n",
-			formatMySQLVersion(sdiInfo.MySQLVersionID), sdiInfo.DDVersion, sdiInfo.SDIVersion)
-		fmt.Printf("Tables in SDI: %d\n", len(rawTables))
-	}
-
-	var parsed []*ddTableJSON
-	for _, raw := range rawTables {
-		var dt ddTableJSON
-		if err := json.Unmarshal(raw, &dt); err != nil {
-			return fmt.Errorf("parsing SDI table JSON: %w", err)
+	var target *ddTableJSON
+	if !sp.Flags.sdi {
+		// Pre-8.0: no SDI at all - fall back to the .frm file that must
+		// sit alongside the .ibd (see findLegacyFRM).
+		frmPath, err := findLegacyFRM(*filePath)
+		if err != nil {
+			return err
 		}
-		parsed = append(parsed, &dt)
-	}
+		if *verbose {
+			fmt.Printf("SDI:         absent (pre-8.0 tablespace) - using %s\n", frmPath)
+		}
+		target, err = parseFRM(frmPath, sp)
+		if err != nil {
+			return fmt.Errorf("reading %s: %w", frmPath, err)
+		}
+	} else {
+		rawTables, sdiInfo, err := LoadSDITables(sp)
+		if err != nil {
+			return fmt.Errorf("reading SDI: %w", err)
+		}
+		if len(rawTables) == 0 {
+			return fmt.Errorf("no table definitions found in this tablespace's SDI")
+		}
+		if *verbose {
+			fmt.Printf("SDI:         present (written by MySQL %s, dd_version %d, sdi_version %d)\n",
+				formatMySQLVersion(sdiInfo.MySQLVersionID), sdiInfo.DDVersion, sdiInfo.SDIVersion)
+			fmt.Printf("Tables in SDI: %d\n", len(rawTables))
+		}
 
-	target, err := pickTable(parsed, *filePath, *tableName)
-	if err != nil {
-		return err
+		var parsed []*ddTableJSON
+		for _, raw := range rawTables {
+			var dt ddTableJSON
+			if err := json.Unmarshal(raw, &dt); err != nil {
+				return fmt.Errorf("parsing SDI table JSON: %w", err)
+			}
+			parsed = append(parsed, &dt)
+		}
+
+		target, err = pickTable(parsed, *filePath, *tableName)
+		if err != nil {
+			return err
+		}
 	}
 
 	t, err := BuildTable(target)
@@ -241,6 +260,21 @@ func run() error {
 // stuff readable straight from the FSP header on page 0, before any
 // SDI/dictionary parsing has happened (so it's useful even when that part
 // fails or the file predates SDI entirely).
+// findLegacyFRM looks for the .frm file a pre-8.0 .ibd file's schema must
+// come from, right next to it (table.ibd -> table.frm in the same
+// directory - the two are always siblings on a real server, since MySQL
+// itself requires that layout).
+func findLegacyFRM(ibdPath string) (string, error) {
+	dir := filepath.Dir(ibdPath)
+	base := strings.TrimSuffix(filepath.Base(ibdPath), filepath.Ext(ibdPath))
+	frmPath := filepath.Join(dir, base+".frm")
+	if _, err := os.Stat(frmPath); err != nil {
+		return "", fmt.Errorf("this tablespace has no SDI (a pre-8.0 MySQL 5.6/5.7 file), and no matching %s was found next to it - "+
+			"place the table's .frm file in the same directory as the .ibd file (MariaDB's .frm format differs and isn't supported)", filepath.Base(frmPath))
+	}
+	return frmPath, nil
+}
+
 func printSpaceInfo(sp *Space, path string) {
 	fi, err := os.Stat(path)
 	size := int64(-1)

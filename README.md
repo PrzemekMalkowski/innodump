@@ -1,11 +1,13 @@
 # 🗄️ ibd-extractor
 
-`ibd-extractor` is an offline reader for a single MySQL 8.0/8.4 InnoDB
-tablespace file (`table.ibd`, file-per-table mode). Given `table.ibd`, it
-produces:
+`ibd-extractor` is an offline reader for a single MySQL InnoDB tablespace
+file (`table.ibd`, file-per-table mode) — MySQL 8.0/8.4, or 5.6/5.7 given
+the table's `.frm` file alongside it (see "MySQL 5.6/5.7 (.frm) support",
+below). Given `table.ibd`, it produces:
 
 - `table-schema.sql` — a best-effort `CREATE TABLE` statement, reconstructed
-  from the table's own embedded dictionary information (SDI).
+  from the table's own embedded dictionary information (SDI), or its `.frm`
+  file for a pre-8.0 table.
 - `table-data.sql` — one `INSERT INTO ... VALUES (...);` statement per live
   row, decoded by walking the table's clustered index (its B+tree) directly
   in the file.
@@ -65,11 +67,12 @@ Supported: MySQL **8.0.16+ and 8.4.x** tablespaces, `ROW_FORMAT=DYNAMIC`,
 `.ibd` files — including tables with `INSTANT ADD COLUMN` / `INSTANT DROP
 COLUMN` history, both MySQL's original (8.0.12-8.0.28) mechanism and the
 row-versioning one that superseded it in 8.0.29+ (see "INSTANT ADD/DROP
-COLUMN", below). `ROW_FORMAT=REDUNDANT` uses the pre-5.0.3 "old-style"
-record layout (a per-field cumulative-offset array instead of a NULL
-bitmap + variable-length list), decoded by `redundant.go`; it is what a
-table created under MySQL 5.7 (and never rebuilt since) will still have,
-so this is also what makes a 5.7-era table's `.ibd` file readable. Row
+COLUMN", below) — plus **MySQL 5.6/5.7**, given the table's `.frm` file
+alongside its `.ibd` (see "MySQL 5.6/5.7 (.frm) support", below).
+`ROW_FORMAT=REDUNDANT` uses the pre-5.0.3 "old-style" record layout (a
+per-field cumulative-offset array instead of a NULL bitmap + variable-length
+list), decoded by `redundant.go`; it is what a 5.6/5.7 table (or an
+8.0+ one never rebuilt since an upgrade) will still have. Row
 versioning is not combined with `REDUNDANT` in practice (a table can't
 gain `INSTANT ADD/DROP COLUMN` history without also being converted off
 `REDUNDANT` first), so that specific — vanishingly rare — combination is
@@ -98,16 +101,50 @@ mis-decoded):
 
 - Encrypted tablespaces.
 - Partitioned tables.
-- **MariaDB** (10.x/11.x) tablespaces, even though they're InnoDB
-  under the hood: MariaDB has no SDI. Schema lives outside the
-  tablespace file entirely (a separate `.frm`/data-dictionary file), and
-  its instant-column encoding differs from MySQL's, so reading a MariaDB
-  `.ibd` file isn't an extension of this tool's approach — it would need
-  its own schema-discovery path built from the ground up. Deliberately
-  left out of scope rather than attempted.
+- **MariaDB** (10.x/11.x) tablespaces, even though they're InnoDB under
+  the hood: MariaDB has no SDI, and its own `.frm` format is a genuinely
+  different, incompatible layout from MySQL's (confirmed empirically, not
+  just assumed — a real MariaDB 10.6 table's `.frm` came out roughly a
+  tenth the size of an equivalent MySQL one), so it doesn't ride along
+  with the MySQL 5.6/5.7 `.frm` support below. Deliberately left out of
+  scope rather than attempted.
 - Full-text and spatial indexes are rendered into the DDL as best-effort
   `FULLTEXT KEY`/`SPATIAL KEY` clauses, but are never walked for data —
   only the clustered index is (all the data lives there regardless).
+
+## MySQL 5.6/5.7 (`.frm`) support
+
+MySQL didn't introduce SDI until 8.0 — a 5.6/5.7 tablespace carries no
+embedded schema at all. Point this tool at a pre-8.0 `.ibd` file and it
+looks for a `.frm` file with the same base name in the same directory
+(`table.ibd` → `table.frm`) and parses that instead (`frm.go`), ported
+from `open_binary_frm()`/`make_field_from_frm()` in the mysql-server
+source and cross-checked byte-for-byte against real `.frm` files from
+live MySQL 5.6.51 and 5.7.44 servers. Once parsed, it's turned into
+exactly the same internal model the SDI path builds, so every other part
+of this tool (the record decoder, the corruption handling, `--verbose`,
+DDL generation) runs completely unchanged.
+
+A `.frm` carries no InnoDB-internal physical detail (that lived in the
+pre-8.0 internal data dictionary, inside `ibdata1`, which this tool has
+no access to and no need for) — notably, no clustered index root page
+number. This relies instead on a well-known InnoDB convention, confirmed
+empirically: a fresh file-per-table tablespace's first-created index —
+always the clustered index — gets root page 3. If that page isn't
+actually an index page, extraction fails with a clear error rather than
+guessing further; this is the one place a `.frm`-based extraction could
+run into a table layout this convention doesn't hold for.
+
+**Not supported for the `.frm` path** (on top of the exclusions above,
+none of which are 5.6/5.7-specific): generated/virtual columns (5.7.6+;
+rejected explicitly, since decoding them needs a section of the `.frm`
+this tool doesn't read), views, and a `.frm` old enough to need a
+"legacy field-position" reconciliation (`find_field()` in the original
+source) — vanishingly rare for anything actually created on a live
+5.6/5.7 server. Partitioned tables are *not* explicitly excluded here:
+each partition is its own ordinary single-table tablespace file sharing
+the one `.frm`, and pointing this tool at one partition's `.ibd` file
+directly works the same way it would for any other table.
 
 ## INSTANT ADD/DROP COLUMN
 
@@ -227,6 +264,17 @@ compressed leaf record's field-info-block entries don't map one-to-one to
 its physical columns; see `tableZipShape`'s doc comment in
 `zipdecompress.go`), fixed and reconfirmed against it and every existing
 fixture.
+
+The `.frm` path was validated the same way, against real MySQL 5.6.51 and
+5.7.44 servers: `ROW_FORMAT=COMPACT`, `DYNAMIC`, and `COMPRESSED` tables
+covering `INT`/`VARCHAR`/`DECIMAL`/`DATETIME`/`TINYINT`/`TEXT`/`ENUM`/`SET`,
+a composite `PRIMARY KEY`, `UNIQUE`/plain secondary indexes, an
+`AUTO_INCREMENT` column, `FLOAT UNSIGNED`, `NULL`s, and multi-byte
+(`utf8mb4`) string data. Reload-and-diff came back byte-for-byte identical
+in every case (MySQL 5.6's own default checksum algorithm predates `crc32`
+and isn't implemented here either — see "Corrupted pages" — so a real 5.6
+file needs `SET GLOBAL innodb_checksum_algorithm=crc32` and a rewrite, e.g.
+`ALTER TABLE ... ENGINE=InnoDB`, before this tool can read it).
 
 Corruption handling was validated by flipping a byte in a real leaf page of
 a 2,000-row, 72-leaf-page table: the default run stopped with the exact
