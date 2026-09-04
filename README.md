@@ -215,10 +215,17 @@ table with about half its rows deleted (exercising the free-list/dense-
 directory path), a table updated enough times in place to leave a
 non-empty modification log, and a 3,000-row/multi-page table spanning a
 non-leaf level whose root page's own content lives entirely in its
-modification log rather than its compressed image),
-reloading the generated `*-schema.sql` + `*-data.sql` into a fresh database
-and diffing every row against the original table (`SELECT * FROM orig
-EXCEPT SELECT * FROM reloaded`, both directions) came back empty.
+modification log rather than its compressed image), reloading the
+generated `*-schema.sql` + `*-data.sql` into a fresh database and diffing
+every row against the original table (`SELECT * FROM orig EXCEPT SELECT *
+FROM reloaded`, both directions) came back empty. Also cross-checked
+against the standard Sakila sample database's `rental` table (16,044 rows,
+`ROW_FORMAT=COMPRESSED`, real production-shaped data) on Percona Server
+8.4.8 — a real file surfaced a bug the synthetic fixtures hadn't (a
+compressed leaf record's field-info-block entries don't map one-to-one to
+its physical columns; see `tableZipShape`'s doc comment in
+`zipdecompress.go`), fixed and reconfirmed against it and every existing
+fixture.
 
 Corruption handling was validated by flipping a byte in a real leaf page of
 a 2,000-row, 72-leaf-page table: the default run stopped with the exact

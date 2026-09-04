@@ -100,37 +100,57 @@ type zipIndexShape struct {
 	NonLeafFields []*IndexField // key columns + a 4-byte node-pointer field
 }
 
-// zipTrxRollField is DB_TRX_ID and DB_ROLL_PTR's field-info-block entry:
-// on a compressed page's leaf record, these two system columns are always
-// described as a single fused fixed-length(13), not-null field - confirmed
-// empirically (a real page's field-info block byte-for-byte matches this,
-// and only this - see the file comment), not merely inferred from
-// PAGE_ZIP_CLUST_LEAF_SLOT_SIZE's similar-looking pairing elsewhere. This
-// is fine for zipFillRecordData/zipRestoreStorage as-is: they only ever
-// skip/restore the first trxRollLen bytes of shape.TrxIDIdx's field and let
-// the next field's own gap-fill pick up anything past that - which for a
-// real table's DB_TRX_ID+DB_ROLL_PTR is nothing (this field is exactly the
-// 13 bytes), but for the SDI index specifically (see sdiZipShape) is not.
-var zipTrxRollField = &IndexField{Col: &Column{}, EffFixedLen: trxRollLen}
-
 // tableZipShape builds the zipIndexShape for a table's own clustered index.
+//
+// A leaf record's field-info-block entries do not correspond one-to-one
+// with its physical fields: every *key* (PRIMARY KEY, or DB_ROW_ID when
+// there's none) column always gets its own entry, but every run of
+// consecutive non-key columns that are all not-null and fixed-length -
+// which DB_TRX_ID+DB_ROLL_PTR always are, immediately followed in physical
+// order by however many of the table's own not-null fixed-length columns
+// happen to come next before the first nullable or variable-length one -
+// is described as a single fused entry (their lengths summed). Confirmed
+// empirically against several real tables of varying shapes (see the file
+// comment) - initially assumed to be a fixed DB_TRX_ID+DB_ROLL_PTR-only
+// pairing, which happened to hold for every table tried until one had a
+// not-null fixed-length column immediately after them too. Fusing them is
+// harmless for zipFillRecordData/zipRestoreStorage either way: they only
+// ever skip/restore the first trxRollLen bytes of shape.TrxIDIdx's field
+// and let the next field's own gap-fill read whatever follows within it,
+// whether that's nothing (a plain table) or more real column data (see
+// sdiZipShape, which fuses even further for a different reason).
 func tableZipShape(t *Table) zipIndexShape {
-	trxIdx := -1
-	leaf := make([]*IndexField, 0, len(t.PhysicalFields))
-	for _, f := range t.PhysicalFields {
-		switch f.Col.Name {
-		case "DB_TRX_ID":
-			trxIdx = len(leaf)
-			leaf = append(leaf, zipTrxRollField)
-		case "DB_ROLL_PTR":
-			// already folded into zipTrxRollField above
-		default:
-			leaf = append(leaf, f)
-		}
-	}
 	nUniq := len(t.PKFields)
 	if !t.HasExplicitPK {
 		nUniq = 1
+	}
+	trxIdx := -1
+	var leaf []*IndexField
+	for i := 0; i < len(t.PhysicalFields); {
+		f := t.PhysicalFields[i]
+		if i < nUniq || f.Col.IsNullable || f.EffFixedLen == 0 {
+			// A key column never fuses (even with another key column -
+			// each needs its own entry for comparison purposes); neither
+			// does a nullable or variable-length one (it needs its own
+			// NULL bit or variable-length-list entry).
+			leaf = append(leaf, f)
+			i++
+			continue
+		}
+		if f.Col.Name == "DB_TRX_ID" {
+			trxIdx = len(leaf)
+		}
+		totalLen, j := f.EffFixedLen, i+1
+		for j < len(t.PhysicalFields) {
+			g := t.PhysicalFields[j]
+			if g.Col.IsNullable || g.EffFixedLen == 0 {
+				break
+			}
+			totalLen += g.EffFixedLen
+			j++
+		}
+		leaf = append(leaf, &IndexField{Col: &Column{}, EffFixedLen: totalLen})
+		i = j
 	}
 	keyFields := t.PhysicalFields[:nUniq] // never includes DB_TRX_ID/DB_ROLL_PTR - no fusing needed
 	nonLeaf := append(append([]*IndexField(nil), keyFields...),
