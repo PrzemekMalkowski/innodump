@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -118,13 +119,15 @@ func run() error {
 	schemaPath := filepath.Join(dir, base+"-schema.sql")
 	dataPath := filepath.Join(dir, base+"-data.sql")
 
-	if err := os.WriteFile(schemaPath, []byte(GenerateDDL(t)), 0644); err != nil {
-		return fmt.Errorf("writing %s: %w", schemaPath, err)
-	}
-
 	outCols := OutputColumns(t)
 	if len(outCols) == 0 {
 		return fmt.Errorf("table %q has no columns this tool can output", t.Name)
+	}
+	autoIncIdx := -1
+	for i, c := range outCols {
+		if c == t.AutoIncrementCol {
+			autoIncIdx = i
+		}
 	}
 
 	f, err := os.Create(dataPath)
@@ -137,6 +140,7 @@ func run() error {
 	prefix := InsertPrefix(t, outCols)
 
 	var nOK, nErr int
+	var maxAutoInc uint64
 	walkErr := WalkRows(sp, t, outCols, func(roe RowOrError) bool {
 		if roe.Err != nil {
 			nErr++
@@ -145,11 +149,26 @@ func run() error {
 			return *limitRows == 0 || nOK+nErr < *limitRows
 		}
 		fmt.Fprintf(f, "%s%s;\n", prefix, FormatRow(roe.Row))
+		if autoIncIdx >= 0 {
+			if v, err := strconv.ParseUint(roe.Row.Values[autoIncIdx], 10, 64); err == nil && v > maxAutoInc {
+				maxAutoInc = v
+			}
+		}
 		nOK++
 		return *limitRows == 0 || nOK < *limitRows
 	})
 	if walkErr != nil {
 		return fmt.Errorf("walking table rows: %w", walkErr)
+	}
+
+	// The SDI carries no persisted auto-increment counter (see
+	// Table.AutoIncrementNext in schema.go); approximate it from the data.
+	if t.AutoIncrementCol != nil {
+		next := maxAutoInc + 1
+		t.AutoIncrementNext = &next
+	}
+	if err := os.WriteFile(schemaPath, []byte(GenerateDDL(t)), 0644); err != nil {
+		return fmt.Errorf("writing %s: %w", schemaPath, err)
 	}
 
 	fmt.Printf("%s %s\n", appName, version)

@@ -116,6 +116,7 @@ type ddColumnJSON struct {
 	IsNullable               bool            `json:"is_nullable"`
 	IsZerofill               bool            `json:"is_zerofill"`
 	IsUnsigned               bool            `json:"is_unsigned"`
+	IsAutoIncrement          bool            `json:"is_auto_increment"`
 	IsVirtual                bool            `json:"is_virtual"`
 	Hidden                   uint32          `json:"hidden"`
 	OrdinalPosition          uint32          `json:"ordinal_position"`
@@ -138,6 +139,7 @@ type ddColumnJSON struct {
 type ddIndexElementJSON struct {
 	OrdinalPosition uint32 `json:"ordinal_position"`
 	Length          uint32 `json:"length"`
+	Order           uint32 `json:"order"`
 	Hidden          bool   `json:"hidden"`
 	ColumnOpx       uint32 `json:"column_opx"`
 }
@@ -145,6 +147,7 @@ type ddIndexElementJSON struct {
 type ddIndexJSON struct {
 	Name          string               `json:"name"`
 	Hidden        bool                 `json:"hidden"`
+	IsVisible     bool                 `json:"is_visible"`
 	SePrivateData string               `json:"se_private_data"`
 	Type          uint32               `json:"type"`
 	Elements      []ddIndexElementJSON `json:"elements"`
@@ -160,32 +163,46 @@ type ddTableJSON struct {
 	SePrivateData string         `json:"se_private_data"`
 	RowFormat     uint32         `json:"row_format"`
 	PartitionType uint32         `json:"partition_type"`
+	CollationID   uint64         `json:"collation_id"`
 	Indexes       []ddIndexJSON  `json:"indexes"`
 }
+
+// Index::enum_index_type (Index.h in the DD).
+const (
+	ddIndexPrimary  = 1
+	ddIndexUnique   = 2
+	ddIndexMultiple = 3
+	ddIndexFulltext = 4
+	ddIndexSpatial  = 5
+)
+
+// IndexColumn::enum_index_element_order (Column.h in the DD).
+const ddOrderDesc = 3
 
 // --- resolved (InnoDB-layer) model ---
 
 type Column struct {
 	raw ddColumnJSON
 
-	Name         string
-	DDType       uint32
-	IsNullable   bool
-	IsUnsigned   bool
-	IsZerofill   bool
-	IsVirtual    bool
-	Hidden       uint32
-	CharLength   uint32
-	NumPrec      uint32
-	NumScale     uint32
-	DatetimePrec uint32
-	TypeText     string // column_type_utf8, e.g. "varchar(255)"
-	CollationID  uint64
-	Comment      string
-	GenExpr      string
-	Elements     []string // decoded ENUM/SET labels, 1-indexed by position
-	HasDefault   bool
-	DefaultText  string
+	Name            string
+	DDType          uint32
+	IsNullable      bool
+	IsUnsigned      bool
+	IsZerofill      bool
+	IsAutoIncrement bool
+	IsVirtual       bool
+	Hidden          uint32
+	CharLength      uint32
+	NumPrec         uint32
+	NumScale        uint32
+	DatetimePrec    uint32
+	TypeText        string // column_type_utf8, e.g. "varchar(255)"
+	CollationID     uint64
+	Comment         string
+	GenExpr         string
+	Elements        []string // decoded ENUM/SET labels, 1-indexed by position
+	HasDefault      bool
+	DefaultText     string
 
 	Mtype    uint32
 	ColLen   uint32 // storage byte length (pack length)
@@ -207,11 +224,30 @@ type IndexField struct {
 	EffFixedLen uint32 // 0 = variable-length in the record
 }
 
+// SecondaryIndexColumn is one column of a non-clustered index, for DDL
+// output only (v1 never walks a secondary index for data - the clustered
+// index already holds every column).
+type SecondaryIndexColumn struct {
+	Col       *Column
+	PrefixLen uint32 // 0 = no prefix
+	Desc      bool
+}
+
+// SecondaryIndex is a non-PRIMARY index, for DDL output only.
+type SecondaryIndex struct {
+	Name              string
+	Unique            bool
+	Fulltext, Spatial bool
+	Visible           bool
+	Columns           []SecondaryIndexColumn
+}
+
 type Table struct {
 	Name, SchemaRef string
 	RowFormat       uint32
 	SePrivateID     uint64
 	Comment         string
+	CollationID     uint64 // table's default collation, for DEFAULT CHARSET/COLLATE
 
 	// All columns, in ordinal (CREATE TABLE) order - used for DDL output.
 	// Includes SE-hidden system columns; callers filter with Hidden/IsSystem.
@@ -221,6 +257,14 @@ type Table struct {
 	PKFields       []*IndexField
 	PhysicalFields []*IndexField // full clustered-index row layout, in order
 	NNullable      int
+
+	SecondaryIndexes []*SecondaryIndex
+
+	// AUTO_INCREMENT: the SDI carries no persisted "next value" (the server
+	// tracks that separately, outside any single tablespace file), so main.go
+	// fills this in from the highest value actually seen while walking rows.
+	AutoIncrementCol  *Column
+	AutoIncrementNext *uint64
 
 	RootPage uint32
 	IndexID  uint64
@@ -431,26 +475,27 @@ func buildColumn(raw ddColumnJSON) (*Column, error) {
 		}
 	}
 	c := &Column{
-		raw:          raw,
-		Name:         raw.Name,
-		DDType:       raw.Type,
-		IsNullable:   raw.IsNullable,
-		IsUnsigned:   raw.IsUnsigned,
-		IsZerofill:   raw.IsZerofill,
-		IsVirtual:    raw.IsVirtual,
-		Hidden:       raw.Hidden,
-		CharLength:   raw.CharLength,
-		NumPrec:      raw.NumericPrecision,
-		NumScale:     raw.NumericScale,
-		DatetimePrec: raw.DatetimePrecision,
-		TypeText:     raw.ColumnTypeUtf8,
-		CollationID:  raw.CollationID,
-		Comment:      raw.Comment,
-		GenExpr:      raw.GenerationExpressionUtf8,
-		Elements:     decodeElements(raw.Elements),
-		HasDefault:   !raw.HasNoDefault && !raw.DefaultValueUtf8Null,
-		DefaultText:  raw.DefaultValueUtf8,
-		IsSystem:     isSystem,
+		raw:             raw,
+		Name:            raw.Name,
+		DDType:          raw.Type,
+		IsNullable:      raw.IsNullable,
+		IsUnsigned:      raw.IsUnsigned,
+		IsZerofill:      raw.IsZerofill,
+		IsAutoIncrement: raw.IsAutoIncrement,
+		IsVirtual:       raw.IsVirtual,
+		Hidden:          raw.Hidden,
+		CharLength:      raw.CharLength,
+		NumPrec:         raw.NumericPrecision,
+		NumScale:        raw.NumericScale,
+		DatetimePrec:    raw.DatetimePrecision,
+		TypeText:        raw.ColumnTypeUtf8,
+		CollationID:     raw.CollationID,
+		Comment:         raw.Comment,
+		GenExpr:         raw.GenerationExpressionUtf8,
+		Elements:        decodeElements(raw.Elements),
+		HasDefault:      !raw.HasNoDefault && !raw.DefaultValueUtf8Null,
+		DefaultText:     raw.DefaultValueUtf8,
+		IsSystem:        isSystem,
 	}
 	if isSystem {
 		c.Mtype = dataSys
@@ -524,6 +569,13 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 		RowFormat:   raw.RowFormat,
 		SePrivateID: raw.SePrivateID,
 		Comment:     raw.Comment,
+		CollationID: raw.CollationID,
+	}
+	for _, c := range colsByOpx {
+		if c.IsAutoIncrement {
+			t.AutoIncrementCol = c
+			break
+		}
 	}
 	// CREATE TABLE / ordinal order, for DDL and for the "everything else"
 	// pass below - stable-sorted defensively even though the SDI already
@@ -614,6 +666,40 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 			t.NNullable++
 		}
 	}
+
+	// Secondary indexes are only ever rendered into the DDL, never walked
+	// for data (the clustered index already carries every column), so this
+	// only needs each index's own explicit (non-hidden) key parts - not the
+	// full SE-layer physical-field machinery used for the clustered index.
+	for _, idx := range raw.Indexes[1:] {
+		if idx.Hidden {
+			continue // e.g. an auto-generated helper index
+		}
+		si := &SecondaryIndex{
+			Name:     idx.Name,
+			Unique:   idx.Type == ddIndexUnique,
+			Fulltext: idx.Type == ddIndexFulltext,
+			Spatial:  idx.Type == ddIndexSpatial,
+			Visible:  idx.IsVisible,
+		}
+		for _, el := range idx.Elements {
+			if el.Hidden {
+				continue
+			}
+			if int(el.ColumnOpx) >= len(colsByOpx) {
+				return nil, fmt.Errorf("index %q references an out-of-range column", idx.Name)
+			}
+			col := colsByOpx[el.ColumnOpx]
+			sic := SecondaryIndexColumn{Col: col, Desc: el.Order == ddOrderDesc}
+			if el.Length < col.ColLen {
+				sic.PrefixLen = el.Length
+			}
+			si.Columns = append(si.Columns, sic)
+		}
+		if len(si.Columns) > 0 {
+			t.SecondaryIndexes = append(t.SecondaryIndexes, si)
+		}
+	}
 	return t, nil
 }
 
@@ -626,6 +712,16 @@ func effectiveFixedLen(col *Column, prefixLen uint32) uint32 {
 		fixed = 0
 	}
 	return fixed
+}
+
+// charsetOf derives a charset name from its default collation name (e.g.
+// "utf8mb4_0900_ai_ci" -> "utf8mb4"): every charset name in collationTable
+// is itself free of underscores, so splitting on the first one is exact.
+func charsetOf(collationName string) string {
+	if i := strings.IndexByte(collationName, '_'); i >= 0 {
+		return collationName[:i]
+	}
+	return collationName
 }
 
 func rowFormatName(rf uint32) string {

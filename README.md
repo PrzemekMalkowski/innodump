@@ -74,18 +74,30 @@ mis-decoded):
   `ALTER TABLE ... ADD COLUMN` run on them — a v2 goal is to support it
   (see `schema.go` and `record.go`'s package comments for exactly what
   additional bookkeeping that needs).
-- Full-text and spatial indexes (irrelevant here: only the clustered index
-  is ever walked).
+- Full-text and spatial indexes are rendered into the DDL as best-effort
+  `FULLTEXT KEY`/`SPATIAL KEY` clauses, but are never walked for data —
+  only the clustered index is (all the data lives there regardless).
 - Pre-8.0 tablespaces (no embedded SDI to read at all).
 
 ## Output notes
 
 - **DDL is best-effort.** Column types (including `unsigned`/`zerofill`),
-  nullability, comments, generated-column expressions, and the `PRIMARY
-  KEY` are reproduced from the SDI. `DEFAULT` clauses, `AUTO_INCREMENT`
-  counters, secondary indexes, and table-level options are not — add them
-  by hand if you need an exact round-trip DDL, or restore alongside the
-  original `SHOW CREATE TABLE` output if you have it.
+  nullability, `AUTO_INCREMENT`, comments, generated-column expressions,
+  the `PRIMARY KEY`, secondary indexes (`KEY`/`UNIQUE KEY`/`FULLTEXT
+  KEY`/`SPATIAL KEY`, including prefix lengths, `DESC` order, and
+  `INVISIBLE`), and the table's default charset/collation are reproduced
+  from the SDI. `DEFAULT` clauses and other table-level options are not —
+  add them by hand if you need an exact round-trip DDL, or restore
+  alongside the original `SHOW CREATE TABLE` output if you have it.
+- **`AUTO_INCREMENT=N`** is *not* in the SDI at all — the server tracks
+  that counter separately, outside any single tablespace file. It's
+  approximated as the highest value seen in the auto-increment column
+  across the table's live rows, plus one. This is exact as long as nothing
+  was ever deleted from the high end of the column (the common case); if
+  rows near the current max were deleted, or the counter was bumped ahead
+  manually (e.g. `ALTER TABLE ... AUTO_INCREMENT=N`) without inserting up
+  to it, the real counter can be higher than this tool can recover from
+  the file alone.
 - **String columns** are emitted as their raw stored bytes inside a quoted
   SQL string literal. For `utf8mb3`/`utf8mb4` columns (the common case)
   this is already correct UTF-8. For any other character set, the bytes
@@ -107,10 +119,11 @@ This was cross-checked end to end against real MySQL 8.0.46 and 8.4.11
 servers: for every test table (plain types, every scalar type including
 `DECIMAL`/`BIT`/`ENUM`/`SET`/`JSON`/all temporal types, off-page
 BLOB/TEXT values up to 32 KB spanning multiple LOB pages, tables with no
-explicit `PRIMARY KEY`, and composite-key tables), reloading the generated
-`*-schema.sql` + `*-data.sql` into a fresh database and diffing every row
-against the original table (`SELECT * FROM orig EXCEPT SELECT * FROM
-reloaded`, both directions) came back empty.
+explicit `PRIMARY KEY`, composite-key tables, and a table with
+`AUTO_INCREMENT` + secondary indexes + deleted rows), reloading the
+generated `*-schema.sql` + `*-data.sql` into a fresh database and diffing
+every row against the original table (`SELECT * FROM orig EXCEPT SELECT *
+FROM reloaded`, both directions) came back empty.
 
 ## Acknowledgements
 
