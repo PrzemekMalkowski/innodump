@@ -266,8 +266,9 @@ type Table struct {
 	AutoIncrementCol  *Column
 	AutoIncrementNext *uint64
 
-	RootPage uint32
-	IndexID  uint64
+	RootPage  uint32
+	IndexID   uint64
+	IndexName string // the clustered index's own SDI name (usually "PRIMARY")
 }
 
 // decodeElements base64-decodes the ENUM/SET label list from the SDI.
@@ -590,6 +591,7 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 	}
 	clust := raw.Indexes[0] // Index::FillSeIndex: ind==0 is always the clustered index
 	t.HasExplicitPK = !clust.Hidden
+	t.IndexName = clust.Name
 	t.IndexID = 0
 	if p := sePropString(clust.SePrivateData); p["id"] != "" {
 		fmt.Sscanf(p["id"], "%d", &t.IndexID)

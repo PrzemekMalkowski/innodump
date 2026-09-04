@@ -45,13 +45,15 @@ const (
 )
 
 var (
-	filePath    = flag.String("file", "", "Path to the .ibd file to extract")
-	outDir      = flag.String("out-dir", "", "Directory for the output .sql files (default: alongside --file)")
-	tableName   = flag.String("table", "", "Table name to extract, if the SDI holds more than one")
-	limitRows   = flag.Int("limit", 0, "Stop after this many rows (0 = all)")
-	showVersion = flag.Bool("version", false, "Print version and exit")
-	dumpPage    = flag.Int("dump-page", -1, "debug: hex-dump one page and its record chain, then exit")
-	debug       = flag.Bool("debug", false, "debug: print each record's decoded field byte-ranges as they're read")
+	filePath      = flag.String("file", "", "Path to the .ibd file to extract")
+	outDir        = flag.String("out-dir", "", "Directory for the output .sql files (default: the current directory)")
+	tableName     = flag.String("table", "", "Table name to extract, if the SDI holds more than one")
+	limitRows     = flag.Int("limit", 0, "Stop after this many rows (0 = all)")
+	ddlOnly       = flag.Bool("ddl-only", false, "Only write the schema file; skip walking the table's data entirely")
+	skipCorrupted = flag.Bool("skip-corrupted", false, "On a corrupted leaf page, note it and try to carry on from the next page instead of stopping")
+	showVersion   = flag.Bool("version", false, "Print version and exit")
+	dumpPage      = flag.Int("dump-page", -1, "debug: hex-dump one page and its record chain, then exit")
+	debug         = flag.Bool("debug", false, "debug: print each record's decoded field byte-ranges as they're read")
 )
 
 func main() {
@@ -63,7 +65,7 @@ func main() {
 	if *filePath == "" {
 		fmt.Printf("%s %s\n", appName, version)
 		fmt.Printf("Usage: %s --file /path/to/table.ibd [--out-dir DIR] [--table NAME] [--limit N]\n", appName)
-		fmt.Println("       [--debug] [--dump-page N] [--version]")
+		fmt.Println("       [--ddl-only] [--skip-corrupted] [--debug] [--dump-page N] [--version]")
 		os.Exit(1)
 	}
 	if err := run(); err != nil {
@@ -114,7 +116,7 @@ func run() error {
 	base := strings.TrimSuffix(filepath.Base(*filePath), filepath.Ext(*filePath))
 	dir := *outDir
 	if dir == "" {
-		dir = filepath.Dir(*filePath)
+		dir = "."
 	}
 	schemaPath := filepath.Join(dir, base+"-schema.sql")
 	dataPath := filepath.Join(dir, base+"-data.sql")
@@ -123,61 +125,82 @@ func run() error {
 	if len(outCols) == 0 {
 		return fmt.Errorf("table %q has no columns this tool can output", t.Name)
 	}
-	autoIncIdx := -1
-	for i, c := range outCols {
-		if c == t.AutoIncrementCol {
-			autoIncIdx = i
-		}
-	}
 
-	f, err := os.Create(dataPath)
-	if err != nil {
-		return fmt.Errorf("writing %s: %w", dataPath, err)
-	}
-	defer f.Close()
-
-	fmt.Fprintf(f, "-- Decoded by ibd-extractor from %s, table %s.%s\n", filepath.Base(*filePath), t.SchemaRef, t.Name)
-	prefix := InsertPrefix(t, outCols)
-
-	var nOK, nErr int
-	var maxAutoInc uint64
-	walkErr := WalkRows(sp, t, outCols, func(roe RowOrError) bool {
-		if roe.Err != nil {
-			nErr++
-			fmt.Fprintf(os.Stderr, "warning: page %d rec@0x%x: %v\n", roe.PageNo, roe.RecOff, roe.Err)
-			fmt.Fprintf(f, "-- skipped a row at page %d rec@0x%x: %v\n", roe.PageNo, roe.RecOff, roe.Err)
-			return *limitRows == 0 || nOK+nErr < *limitRows
-		}
-		fmt.Fprintf(f, "%s%s;\n", prefix, FormatRow(roe.Row))
-		if autoIncIdx >= 0 {
-			if v, err := strconv.ParseUint(roe.Row.Values[autoIncIdx], 10, 64); err == nil && v > maxAutoInc {
-				maxAutoInc = v
+	var nOK, nErr, nCorruptPages int
+	if *ddlOnly {
+		fmt.Printf("%s %s\n", appName, version)
+		fmt.Printf("Table:       %s.%s (row_format=%s)\n", t.SchemaRef, t.Name, rowFormatName(t.RowFormat))
+		fmt.Printf("Columns:     %d output (%d total incl. system/hidden)\n", len(outCols), len(t.Columns))
+	} else {
+		autoIncIdx := -1
+		for i, c := range outCols {
+			if c == t.AutoIncrementCol {
+				autoIncIdx = i
 			}
 		}
-		nOK++
-		return *limitRows == 0 || nOK < *limitRows
-	})
-	if walkErr != nil {
-		return fmt.Errorf("walking table rows: %w", walkErr)
+
+		f, err := os.Create(dataPath)
+		if err != nil {
+			return fmt.Errorf("writing %s: %w", dataPath, err)
+		}
+		defer f.Close()
+
+		fmt.Fprintf(f, "-- Decoded by ibd-extractor from %s, table %s.%s\n", filepath.Base(*filePath), t.SchemaRef, t.Name)
+		prefix := InsertPrefix(t, outCols)
+
+		var maxAutoInc uint64
+		onCorrupt := func(cp CorruptPage) {
+			nCorruptPages++
+			fmt.Fprintf(os.Stderr, "warning: corrupted page %d (index %q, id %d): %s\n", cp.PageNo, t.IndexName, t.IndexID, cp.Reason)
+			fmt.Fprintf(f, "-- skipped corrupted page %d (table %s.%s, index %q, id %d): %s\n",
+				cp.PageNo, t.SchemaRef, t.Name, t.IndexName, t.IndexID, cp.Reason)
+		}
+		walkErr := WalkRows(sp, t, outCols, *skipCorrupted, onCorrupt, func(roe RowOrError) bool {
+			if roe.Err != nil {
+				nErr++
+				fmt.Fprintf(os.Stderr, "warning: page %d rec@0x%x: %v\n", roe.PageNo, roe.RecOff, roe.Err)
+				fmt.Fprintf(f, "-- skipped a row at page %d rec@0x%x: %v\n", roe.PageNo, roe.RecOff, roe.Err)
+				return *limitRows == 0 || nOK+nErr < *limitRows
+			}
+			fmt.Fprintf(f, "%s%s;\n", prefix, FormatRow(roe.Row))
+			if autoIncIdx >= 0 {
+				if v, err := strconv.ParseUint(roe.Row.Values[autoIncIdx], 10, 64); err == nil && v > maxAutoInc {
+					maxAutoInc = v
+				}
+			}
+			nOK++
+			return *limitRows == 0 || nOK < *limitRows
+		})
+		if walkErr != nil {
+			return fmt.Errorf("walking table rows: %w", walkErr)
+		}
+
+		// The SDI carries no persisted auto-increment counter (see
+		// Table.AutoIncrementNext in schema.go); approximate it from the data.
+		if t.AutoIncrementCol != nil {
+			next := maxAutoInc + 1
+			t.AutoIncrementNext = &next
+		}
+
+		fmt.Printf("%s %s\n", appName, version)
+		fmt.Printf("Table:       %s.%s (row_format=%s)\n", t.SchemaRef, t.Name, rowFormatName(t.RowFormat))
+		fmt.Printf("Columns:     %d output (%d total incl. system/hidden)\n", len(outCols), len(t.Columns))
 	}
 
-	// The SDI carries no persisted auto-increment counter (see
-	// Table.AutoIncrementNext in schema.go); approximate it from the data.
-	if t.AutoIncrementCol != nil {
-		next := maxAutoInc + 1
-		t.AutoIncrementNext = &next
-	}
 	if err := os.WriteFile(schemaPath, []byte(GenerateDDL(t)), 0644); err != nil {
 		return fmt.Errorf("writing %s: %w", schemaPath, err)
 	}
-
-	fmt.Printf("%s %s\n", appName, version)
-	fmt.Printf("Table:       %s.%s (row_format=%s)\n", t.SchemaRef, t.Name, rowFormatName(t.RowFormat))
-	fmt.Printf("Columns:     %d output (%d total incl. system/hidden)\n", len(outCols), len(t.Columns))
 	fmt.Printf("Schema file: %s\n", schemaPath)
+
+	if *ddlOnly {
+		return nil
+	}
 	fmt.Printf("Data file:   %s (%d row(s) written", dataPath, nOK)
 	if nErr > 0 {
 		fmt.Printf(", %d row(s) skipped - see warnings above", nErr)
+	}
+	if nCorruptPages > 0 {
+		fmt.Printf(", %d corrupted page(s) skipped - see warnings above", nCorruptPages)
 	}
 	fmt.Printf(")\n")
 	return nil

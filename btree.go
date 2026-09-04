@@ -10,7 +10,10 @@ import (
 
 // leftmostLeaf descends from root to the leftmost page at level 0, reading
 // the child page number out of the first (leftmost) non-leaf record on each
-// level via nonLeafChildPage.
+// level via nonLeafChildPage. Unlike the leaf-level walk in WalkRows, a
+// corrupt page here is always fatal (regardless of --skip-corrupted): there
+// is no well-defined "next page" to fall back to while still finding our way
+// down to the correct leftmost leaf.
 func leftmostLeaf(sp *Space, t *Table) (uint32, error) {
 	page, err := sp.ReadPage(t.RootPage)
 	if err != nil {
@@ -18,6 +21,9 @@ func leftmostLeaf(sp *Space, t *Table) (uint32, error) {
 	}
 	cur := t.RootPage
 	for pageGetLevel(page) != 0 {
+		if pc := checkPage(page); !pc.OK {
+			return 0, fmt.Errorf("page %d (index %q, id %d): %s", cur, t.IndexName, t.IndexID, pc.Reason)
+		}
 		if recStatus(page, pageNewInfimum) != recStatusInfimum {
 			return 0, fmt.Errorf("corrupt index page %d: expected infimum", cur)
 		}
@@ -87,9 +93,25 @@ type RowOrError struct {
 	Err            error
 }
 
+// CorruptPage describes one leaf page that failed validation.
+type CorruptPage struct {
+	PageNo uint32
+	Reason string
+}
+
 // WalkRows decodes every live (non-delete-marked) row in the clustered
 // index and streams it to fn. fn returning false stops the walk early.
-func WalkRows(sp *Space, t *Table, outCols []*Column, fn func(RowOrError) bool) error {
+//
+// Every leaf page is validated (checksum/LSN consistency, page type, index
+// id) before its records are read. By default a bad page is a fatal error
+// (stop and report exactly where and why - the caller can hand that
+// straight to the user rather than continuing past silently-wrong data).
+// With skipCorrupted, onCorrupt is called instead for each bad page and the
+// walk tries to press on: it still trusts that page's own FIL_PAGE_NEXT
+// pointer (corruption is often localized to the page body, leaving the
+// header intact) to reach the next page, stopping only if that pointer is
+// itself missing or unusable. onCorrupt may be nil.
+func WalkRows(sp *Space, t *Table, outCols []*Column, skipCorrupted bool, onCorrupt func(CorruptPage), fn func(RowOrError) bool) error {
 	leaf, err := leftmostLeaf(sp, t)
 	if err != nil {
 		return fmt.Errorf("finding the leftmost leaf page: %w", err)
@@ -100,11 +122,27 @@ func WalkRows(sp *Space, t *Table, outCols []*Column, fn func(RowOrError) bool) 
 		if err != nil {
 			return err
 		}
-		if filType(page) != filPageIndex {
-			return fmt.Errorf("page %d: expected an INDEX page, got type %d", pageNo, filType(page))
+		reason := ""
+		if pc := checkPage(page); !pc.OK {
+			reason = pc.Reason
+		} else if filType(page) != filPageIndex {
+			reason = fmt.Sprintf("expected an INDEX page, got type %d", filType(page))
+		} else if pageGetIndexID(page) != t.IndexID {
+			reason = fmt.Sprintf("belongs to index id %d, not the expected %d", pageGetIndexID(page), t.IndexID)
 		}
-		if pageGetIndexID(page) != t.IndexID {
-			return fmt.Errorf("page %d: belongs to index id %d, not the expected %d (leaf chain is corrupt)", pageNo, pageGetIndexID(page), t.IndexID)
+		if reason != "" {
+			if !skipCorrupted {
+				return fmt.Errorf("page %d (index %q, id %d): %s", pageNo, t.IndexName, t.IndexID, reason)
+			}
+			if onCorrupt != nil {
+				onCorrupt(CorruptPage{PageNo: pageNo, Reason: reason})
+			}
+			next := filNextPage(page)
+			if next == filNull || next == pageNo || next >= sp.NumPages {
+				return nil // no usable way to keep going from here
+			}
+			pageNo = next
+			continue
 		}
 		cont := true
 		walkRecords(page, sp.PageSize, func(recOff uint32) bool {

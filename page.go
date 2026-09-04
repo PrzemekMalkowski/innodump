@@ -17,8 +17,10 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"os"
 )
 
@@ -221,6 +223,67 @@ func (s *Space) ReadPage(pageNo uint32) ([]byte, error) {
 		return nil, fmt.Errorf("reading page %d: %w", pageNo, err)
 	}
 	return buf, nil
+}
+
+// --- Page corruption detection ---
+//
+// Cross-checked against BlockReporter::is_corrupted (storage/innobase/buf/
+// checksum.cc) in the mysql-server source. This implements the two checks
+// that cover the overwhelming majority of real installations:
+//
+//   - the LSN consistency check (always done, independent of checksum
+//     algorithm): the low 4 bytes of the FIL_PAGE_LSN field must equal the
+//     page's last 4 bytes, which store the same value redundantly.
+//   - the "crc32" checksum algorithm (innodb_checksum_algorithm=crc32, the
+//     default since 5.7), which is CRC-32C (Castagnoli), NOT the plain CRC-32
+//     zlib/gzip use - confirmed empirically against real pages before
+//     relying on it here.
+//
+// Not implemented: the legacy "innodb" checksum algorithm (a custom Fletcher
+// -like hash, pre-5.7 default) and page-compressed (zlib) checksums, which
+// are out of scope anyway (v1 rejects compressed tablespaces in OpenSpace).
+// A tablespace still using innodb_checksum_algorithm=innodb will report
+// false corruption here; --skip-corrupted or a real innochecksum run can
+// tell the two apart.
+const bufNoChecksumMagic = 0xDEADBEEF
+
+var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
+
+// pageCheck is the result of validating one page's checksum/LSN fields.
+type pageCheck struct {
+	OK     bool
+	Empty  bool // an unallocated, all-zero page - not corrupt, just unused
+	Reason string
+}
+
+func checkPage(page []byte) pageCheck {
+	n := len(page)
+	if n < filPageData+filPageDataEnd {
+		return pageCheck{Reason: "page is shorter than a valid FIL header+trailer"}
+	}
+	if !bytes.Equal(page[filPageLSN+4:filPageLSN+8], page[n-4:n]) {
+		return pageCheck{Reason: "LSN low bytes at the start and end of the page disagree"}
+	}
+	f1 := binary.BigEndian.Uint32(page[0:4])
+	f2 := binary.BigEndian.Uint32(page[n-8 : n-4])
+	lsn8 := binary.BigEndian.Uint64(page[filPageLSN:])
+	if f1 == 0 && f2 == 0 && lsn8 == 0 {
+		for _, b := range page {
+			if b != 0 {
+				return pageCheck{Reason: "checksum and LSN fields are zero but the page is not"}
+			}
+		}
+		return pageCheck{OK: true, Empty: true}
+	}
+	if f1 == bufNoChecksumMagic && f2 == bufNoChecksumMagic {
+		return pageCheck{OK: true} // innodb_checksum_algorithm=none
+	}
+	c1 := crc32.Checksum(page[4:26], crc32cTable)
+	c2 := crc32.Checksum(page[38:n-8], crc32cTable)
+	if f1 == f2 && f1 == c1^c2 {
+		return pageCheck{OK: true}
+	}
+	return pageCheck{Reason: fmt.Sprintf("checksum mismatch (stored %08x/%08x, computed crc32c %08x)", f1, f2, c1^c2)}
 }
 
 // --- FIL header accessors (operate on a single page's bytes) ---

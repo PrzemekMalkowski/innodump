@@ -47,9 +47,11 @@ ibd-extractor --file /path/to/table.ibd [options]
 | Flag | Description |
 |------|-------------|
 | `--file PATH` | Path to the `.ibd` file (required). |
-| `--out-dir DIR` | Directory for the two output files (default: alongside `--file`). |
+| `--out-dir DIR` | Directory for the two output files (default: the current directory). |
 | `--table NAME` | Which table to extract, if the file's SDI unexpectedly holds more than one. |
 | `--limit N` | Stop after N rows (0 = all). |
+| `--ddl-only` | Only write the schema file; skip walking the table's data entirely. |
+| `--skip-corrupted` | On a corrupted leaf page, note it and carry on from the next page instead of stopping. |
 | `--debug` | Print each record's decoded field byte-ranges as they're read. |
 | `--dump-page N` | Hex-dump one page and its record chain, then exit. |
 | `--version` | Print version and exit. |
@@ -113,6 +115,32 @@ mis-decoded):
   is skipped with a warning printed to stderr and a `-- skipped a row ...`
   comment in the data file, rather than aborting the whole extraction.
 
+## Corrupted pages
+
+Every leaf page is checksum-verified (the same CRC-32C algorithm and LSN
+consistency check the server itself uses — see `page.go`'s `checkPage`)
+before its records are read, and rejected if its page type or index id
+doesn't match what's expected either. By default a corrupted page is fatal:
+extraction stops immediately with the page number, index name/id, and the
+specific reason (checksum mismatch, wrong page type, etc.) — silently
+skipping past unreadable pages by default would make an incomplete dump
+look like a complete one.
+
+Pass `--skip-corrupted` to keep going instead: each corrupted page is noted
+(a warning on stderr, and a `-- skipped corrupted page ...` comment with
+the page number, table, index name/id, and reason in the data file) and the
+walk tries to carry on using that page's own "next page" pointer, since
+corruption is often localized to the page body and leaves the header
+intact. If that pointer is itself missing or unusable, the walk ends there
+(not as an error — you keep every row decoded up to that point). The final
+summary line reports how many pages were skipped this way.
+
+Only the `crc32` checksum algorithm is verified (the default since MySQL
+5.7 and by far the most common in practice); a tablespace still using the
+legacy `innodb_checksum_algorithm=innodb` will report false corruption —
+cross-check with `innochecksum` if `--skip-corrupted` triggers unexpectedly
+often. Compressed tablespaces are out of scope entirely (see Scope, above).
+
 ## Validation
 
 This was cross-checked end to end against real MySQL 8.0.46 and 8.4.11
@@ -124,6 +152,13 @@ explicit `PRIMARY KEY`, composite-key tables, and a table with
 generated `*-schema.sql` + `*-data.sql` into a fresh database and diffing
 every row against the original table (`SELECT * FROM orig EXCEPT SELECT *
 FROM reloaded`, both directions) came back empty.
+
+Corruption handling was validated by flipping a byte in a real leaf page of
+a 2,000-row, 72-leaf-page table: the default run stopped with the exact
+page/index/reason, and `--skip-corrupted` recovered exactly the 1,972 rows
+outside that one page (a single contiguous gap matching the corrupted
+page's rows, confirmed against the original data), with no false positives
+across any of the other real pages/tables tested.
 
 ## Acknowledgements
 
