@@ -22,7 +22,7 @@ func leftmostLeaf(sp *Space, t *Table) (uint32, error) {
 	}
 	cur := t.RootPage
 	for pageGetLevel(raw) != 0 {
-		if pc := checkPage(raw, sp.Compressed); !pc.OK {
+		if pc := checkPage(raw, sp.Compressed, sp.Flags.fullCRC32); !pc.OK {
 			return 0, fmt.Errorf("page %d (index %q, id %d): %s", cur, t.IndexName, t.IndexID, pc.Reason)
 		}
 		// Decompression (a no-op on an uncompressed tablespace) only ever
@@ -154,7 +154,7 @@ func WalkRows(sp *Space, t *Table, outCols []*Column, skipCorrupted bool, onCorr
 		// the header, which is copied verbatim into the compressed format.
 		reason := ""
 		var page []byte
-		if pc := checkPage(raw, sp.Compressed); !pc.OK {
+		if pc := checkPage(raw, sp.Compressed, sp.Flags.fullCRC32); !pc.OK {
 			reason = pc.Reason
 		} else if filType(raw) != filPageIndex {
 			reason = fmt.Sprintf("expected an INDEX page, got type %d", filType(raw))

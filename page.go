@@ -83,6 +83,25 @@ const (
 	fspFlagsWidthSDI          = 1
 )
 
+// MariaDB's "full_crc32" flags encoding (innodb_checksum_algorithm=
+// full_crc32, the default since MariaDB 10.4) repurposes the low bits of
+// FSP_SPACE_FLAGS entirely: bit 4 is a marker distinguishing this from the
+// classic (MySQL-compatible, and MariaDB's own pre-10.4 default) layout
+// above, and when set, bits 0-3 alone give the logical page size selector
+// - there is no zip_ssize/KEY_BLOCK_SIZE field at all in this encoding
+// (ROW_FORMAT=COMPRESSED doesn't exist under full_crc32; MariaDB's
+// unrelated page_compression feature is a separate flag this tool doesn't
+// need to read for an uncompressed page). Confirmed empirically against a
+// real MariaDB 11.6 tablespace - including hand-verifying its checksum
+// algorithm (a single CRC-32C over the whole page except its own last 4
+// bytes - see checkPage) - before trusting any of this.
+const (
+	fspFlagsFCRC32PosPageSSize   = 0
+	fspFlagsFCRC32WidthPageSSize = 4
+	fspFlagsFCRC32PosMarker      = fspFlagsFCRC32PosPageSSize + fspFlagsFCRC32WidthPageSSize
+	fspFlagsFCRC32WidthMarker    = 1
+)
+
 func fspFlagsField(flags uint32, pos, width uint32) uint32 {
 	mask := ^(^uint32(0) << width)
 	return (flags >> pos) & mask
@@ -90,19 +109,28 @@ func fspFlagsField(flags uint32, pos, width uint32) uint32 {
 
 // fspFlags is the decoded FSP_SPACE_FLAGS word.
 type fspFlags struct {
-	raw          uint32
-	zipSSize     uint32 // compressed page size selector (0 = not compressed)
-	pageSSize    uint32 // logical page size selector (0 = default 16K)
-	postAntelope bool
-	atomicBlobs  bool
-	dataDir      bool
-	shared       bool
-	temporary    bool
-	encryption   bool
-	sdi          bool
+	raw             uint32
+	fullCRC32       bool   // MariaDB's full_crc32 flags encoding is in play - see the constants above
+	fcrc32PageSSize uint32 // logical page size selector, full_crc32 encoding only
+	zipSSize        uint32 // compressed page size selector (0 = not compressed) - classic encoding only
+	pageSSize       uint32 // logical page size selector (0 = default 16K) - classic encoding only
+	postAntelope    bool
+	atomicBlobs     bool
+	dataDir         bool
+	shared          bool
+	temporary       bool
+	encryption      bool
+	sdi             bool
 }
 
 func parseFSPFlags(raw uint32) fspFlags {
+	if fullCRC32 := fspFlagsField(raw, fspFlagsFCRC32PosMarker, fspFlagsFCRC32WidthMarker) != 0; fullCRC32 {
+		return fspFlags{
+			raw:             raw,
+			fullCRC32:       true,
+			fcrc32PageSSize: fspFlagsField(raw, fspFlagsFCRC32PosPageSSize, fspFlagsFCRC32WidthPageSSize),
+		}
+	}
 	return fspFlags{
 		raw:          raw,
 		zipSSize:     fspFlagsField(raw, fspFlagsPosZipSSize, fspFlagsWidthZipSSize),
@@ -189,23 +217,34 @@ func OpenSpace(path string) (*Space, error) {
 	rawFlags := binary.BigEndian.Uint32(head[fspHeaderOffset+fspSpaceFlags:])
 	flags := parseFSPFlags(rawFlags)
 
-	var pageSize uint32
-	if flags.pageSSize == 0 {
-		pageSize = 16384
+	var pageSize, physPageSize uint32
+	if flags.fullCRC32 {
+		// See fspFlagsFCRC32PosMarker's doc comment: no zip_ssize field
+		// exists at all in this encoding, so physical == logical always.
+		// Unlike the classic encoding, 0 here means "invalid" rather than
+		// "default 16K" (ssize 5 means that instead) - the same 512<<ssize
+		// formula already rejects it, landing on 512, which the bounds
+		// check just below refuses.
+		pageSize = (1024 >> 1) << flags.fcrc32PageSSize
+		physPageSize = pageSize
 	} else {
-		pageSize = (1024 >> 1) << flags.pageSSize // 512 << ssize
+		if flags.pageSSize == 0 {
+			pageSize = 16384
+		} else {
+			pageSize = (1024 >> 1) << flags.pageSSize // 512 << ssize
+		}
+		physPageSize = pageSize
+		if flags.zipSSize != 0 {
+			physPageSize = (1024 >> 1) << flags.zipSSize // 512 << ssize
+			if physPageSize < 1024 || physPageSize > pageSize {
+				f.Close()
+				return nil, fmt.Errorf("could not determine a valid compressed page size (flags=0x%08x)", rawFlags)
+			}
+		}
 	}
 	if pageSize < 4096 || pageSize > 65536 || (pageSize&(pageSize-1)) != 0 {
 		f.Close()
 		return nil, fmt.Errorf("could not determine a valid page size (flags=0x%08x)", rawFlags)
-	}
-	physPageSize := pageSize
-	if flags.zipSSize != 0 {
-		physPageSize = (1024 >> 1) << flags.zipSSize // 512 << ssize
-		if physPageSize < 1024 || physPageSize > pageSize {
-			f.Close()
-			return nil, fmt.Errorf("could not determine a valid compressed page size (flags=0x%08x)", rawFlags)
-		}
 	}
 	if flags.encryption {
 		f.Close()
@@ -338,10 +377,33 @@ type pageCheck struct {
 // checked for the "all zero" (unallocated) case, matching how the legacy
 // "innodb" checksum algorithm is already left unverified (see this
 // function's package doc comment, above checkPage's const block).
-func checkPage(page []byte, compressed bool) pageCheck {
+func checkPage(page []byte, compressed, fullCRC32 bool) pageCheck {
 	n := len(page)
 	if n < filPageData+filPageDataEnd {
 		return pageCheck{Reason: "page is shorter than a valid FIL header+trailer"}
+	}
+	if fullCRC32 {
+		// MariaDB's full_crc32 format: a single CRC-32C over the whole
+		// page except its own last 4 bytes (where it's stored) - much
+		// simpler than the classic split-checksum scheme below, and
+		// unrelated to it; hand-verified against a real MariaDB 11.6
+		// page before trusting it (see the FSP_FLAGS doc comment).
+		if !bytes.Equal(page[filPageLSN+4:filPageLSN+8], page[n-8:n-4]) {
+			return pageCheck{Reason: "LSN low bytes at the start and near-end of the page disagree"}
+		}
+		stored := binary.BigEndian.Uint32(page[n-4:])
+		if stored == 0 {
+			for _, b := range page {
+				if b != 0 {
+					return pageCheck{Reason: "checksum is zero but the page is not"}
+				}
+			}
+			return pageCheck{OK: true, Empty: true}
+		}
+		if computed := crc32.Checksum(page[:n-4], crc32cTable); stored != computed {
+			return pageCheck{Reason: fmt.Sprintf("checksum mismatch (stored %08x, computed crc32c %08x)", stored, computed)}
+		}
+		return pageCheck{OK: true}
 	}
 	if compressed {
 		f1 := binary.BigEndian.Uint32(page[0:4])

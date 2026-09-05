@@ -1,9 +1,10 @@
 # 🗄️ ibd-extractor
 
 `ibd-extractor` is an offline reader for a single MySQL InnoDB tablespace
-file (`table.ibd`, file-per-table mode) — MySQL 8.0/8.4, or 5.6/5.7 given
-the table's `.frm` file alongside it (see "MySQL 5.6/5.7 (.frm) support",
-below). Given `table.ibd`, it produces:
+file (`table.ibd`, file-per-table mode) — MySQL 8.0/8.4, MySQL 5.6/5.7 or
+MariaDB given the table's `.frm` file alongside it (see "MySQL 5.6/5.7
+(.frm) support" and "MariaDB support", below). Given `table.ibd`, it
+produces:
 
 - `table-schema.sql` — a best-effort `CREATE TABLE` statement, reconstructed
   from the table's own embedded dictionary information (SDI), or its `.frm`
@@ -101,13 +102,13 @@ mis-decoded):
 
 - Encrypted tablespaces.
 - Partitioned tables.
-- **MariaDB** (10.x/11.x) tablespaces, even though they're InnoDB under
-  the hood: MariaDB has no SDI, and its own `.frm` format is a genuinely
-  different, incompatible layout from MySQL's (confirmed empirically, not
-  just assumed — a real MariaDB 10.6 table's `.frm` came out roughly a
-  tenth the size of an equivalent MySQL one), so it doesn't ride along
-  with the MySQL 5.6/5.7 `.frm` support below. Deliberately left out of
-  scope rather than attempted.
+- **MariaDB** tablespaces using the classic (non-`full_crc32`)
+  `innodb_checksum_algorithm` values (`innodb`/`crc32`/`none` -
+  effectively any MariaDB server older than 10.4, or one that has
+  explicitly turned `full_crc32` off), and MariaDB's own
+  `page_compression` feature (an orthogonal, page-level compression
+  scheme unrelated to `ROW_FORMAT=COMPRESSED`). See "MariaDB support",
+  below, for what *is* covered.
 - Full-text and spatial indexes are rendered into the DDL as best-effort
   `FULLTEXT KEY`/`SPATIAL KEY` clauses, but are never walked for data —
   only the clustered index is (all the data lives there regardless).
@@ -145,6 +146,56 @@ source) — vanishingly rare for anything actually created on a live
 each partition is its own ordinary single-table tablespace file sharing
 the one `.frm`, and pointing this tool at one partition's `.ibd` file
 directly works the same way it would for any other table.
+
+## MariaDB support
+
+MariaDB is InnoDB under the hood but has no SDI, and its default
+checksum format (`innodb_checksum_algorithm=full_crc32`, the default
+since MariaDB 10.4) repurposes the very same `FSP_SPACE_FLAGS` bits
+MySQL uses for `KEY_BLOCK_SIZE`/`zip_ssize` - a MariaDB tablespace with
+those bits set is not actually compressed at all. `page.go` checks a
+marker bit in the flags first and, when it's set, decodes the page size
+from a different (and differently-special-cased: `ssize=5` means 16KiB,
+not `ssize=0` as in classic mode) formula, and verifies pages with
+MariaDB's own checksum scheme instead of MySQL's - a single CRC-32C over
+the whole page except its own last 4 bytes, stored as a plain big-endian
+`uint32` in those last 4 bytes (rather than split across the start and
+end of the page, as classic MySQL checksums are), with the LSN
+consistency check shifted to compare against the second-to-last 4 bytes
+instead of the very last 4.
+
+Once the page/checksum layer is sorted out, a MariaDB tablespace's
+on-disk page and record format is identical to standard InnoDB's, so
+none of the record-decoding logic needed any change. The `.frm` path
+(MariaDB has never had SDI, so every MariaDB table goes through `.frm`
+parsing, not just 5.6/5.7-style ones) also needed no MariaDB-specific
+code: MariaDB's `.frm` wraps an "extra2" tagged section right after the
+64-byte header - conceptually a different mechanism from MySQL's own
+legacy names-table for locating the form-info block - but the field this
+tool already reads to find that block (a 4-byte pointer immediately
+after the header-adjacent blob whose length is `head[4:6]`) resolves to
+the exact same offset under both schemes, so `frm.go`'s existing
+MySQL-5.6/5.7-oriented logic carries over unmodified. Every other byte
+offset downstream (form-info's own fields, the field-definition layout,
+the key-info block) is unchanged between the two servers as well.
+
+MariaDB also introduced a new family of collation IDs (`utf8mb4_uca1400_*`
+and siblings, MariaDB's own default since 10.4, starting at ID 2048 in
+256-ID blocks per charset) that aren't in the classic MySQL collation
+table this tool otherwise relies on for CHAR/VARCHAR byte-width and
+`DEFAULT CHARSET=` decisions; `collations.go` recognizes the range and
+resolves it to the right charset (and thus the right column byte-width),
+though - since a numeric ID alone can't say which of the many
+language/pad-mode variants within a charset's block it is - the
+generated DDL states only `DEFAULT CHARSET=...` for these, not the exact
+`COLLATE=...`.
+
+Validated end-to-end (extraction, then reload onto a real server, diffed
+row-for-row) against MariaDB 11.6.2, uncompressed tables, `full_crc32`
+checksums - both handwritten test tables and a real customer table
+reported against this tool. Not yet validated: older MariaDB checksum
+formats, and MariaDB's own `page_compression` feature (see "Scope (v1)",
+above).
 
 ## INSTANT ADD/DROP COLUMN
 

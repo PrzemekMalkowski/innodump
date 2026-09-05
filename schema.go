@@ -502,7 +502,7 @@ func getFixedSize(mtype uint32, colLen uint32, collationID uint64, isBinary bool
 		if isBinary {
 			return colLen
 		}
-		if cl, ok := collationTable[collationID]; ok && cl.min == cl.max {
+		if cl, ok := collationInfoFor(collationID); ok && cl.min == cl.max {
 			return colLen
 		}
 		return 0

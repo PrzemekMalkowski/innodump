@@ -102,3 +102,58 @@ var collationTable = map[uint64]collationInfo{
 	317: {"utf8mb4_bs_0900_as_cs", 1, 4}, 318: {"utf8mb4_bg_0900_ai_ci", 1, 4}, 319: {"utf8mb4_bg_0900_as_cs", 1, 4}, 320: {"utf8mb4_gl_0900_ai_ci", 1, 4},
 	321: {"utf8mb4_gl_0900_as_cs", 1, 4}, 322: {"utf8mb4_mn_cyrl_0900_ai_ci", 1, 4}, 323: {"utf8mb4_mn_cyrl_0900_as_cs", 1, 4},
 }
+
+// MariaDB 11.x's newer "UCA-14.0.0" collations (e.g. utf8mb4_uca1400_ai_ci,
+// the server default since 10.4) use a completely different id range this
+// tool has no hope of enumerating one collation at a time - there's a
+// separate id per charset, per language variant (icelandic, romanian,
+// polish, ...), per case/accent sensitivity, and per pad mode, easily
+// hundreds of ids. But the *charset* (all that actually matters here - see
+// getFixedSize/frmColumnTypeText, neither of which cares which language's
+// sort order a collation uses) turns out to be identifiable from the id
+// alone: empirically, id 2048 is utf8mb3_uca1400_ai_ci, and each following
+// charset's block of variants starts exactly 256 ids later, in the same
+// order utf8mb3/utf8mb4/ucs2/utf16/utf32 sort - confirmed against a real
+// MariaDB 11.6 server rather than assumed from the one base id alone (a
+// column of each charset, each explicitly given its uca1400 collation).
+var uca1400CharsetBlocks = []collationInfo{
+	{"utf8mb3", 1, 3},
+	{"utf8mb4", 1, 4},
+	{"ucs2", 2, 2},
+	{"utf16", 2, 4},
+	{"utf32", 4, 4},
+}
+
+// collationInfoFor looks up id, falling back to the MariaDB UCA-1400
+// block-range inference above when it's not one of the individually
+// enumerated ids. ok is false only when neither resolves it.
+func collationInfoFor(id uint64) (info collationInfo, ok bool) {
+	if info, ok = collationTable[id]; ok {
+		return info, true
+	}
+	if c, ok := uca1400Charset(id); ok {
+		// name is deliberately not a real collation name (see
+		// uca1400Charset) - fine for the two byte-width-only callers of
+		// this function, but never print it into DDL as a COLLATE value;
+		// use uca1400Charset directly there instead (sqlout.go does).
+		return collationInfo{name: c.name, min: c.min, max: c.max}, true
+	}
+	return collationInfo{}, false
+}
+
+// uca1400Charset identifies just the charset (never a specific collation
+// name - MariaDB has no fixed name for "id 2304" the way collationTable's
+// entries do; only the numbered id/language-variant/pad-mode combination
+// as a whole names one) for an id in MariaDB's UCA-1400 range, via
+// uca1400CharsetBlocks.
+func uca1400Charset(id uint64) (collationInfo, bool) {
+	const base = 2048
+	if id < base {
+		return collationInfo{}, false
+	}
+	block := (id - base) / 256
+	if block >= uint64(len(uca1400CharsetBlocks)) {
+		return collationInfo{}, false
+	}
+	return uca1400CharsetBlocks[block], true
+}

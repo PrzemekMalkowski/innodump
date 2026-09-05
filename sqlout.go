@@ -101,6 +101,12 @@ func GenerateDDL(t *Table) string {
 	}
 	if cl, ok := collationTable[t.CollationID]; ok {
 		fmt.Fprintf(&b, " DEFAULT CHARSET=%s COLLATE=%s", charsetOf(cl.name), cl.name)
+	} else if c, ok := uca1400Charset(t.CollationID); ok {
+		// One of MariaDB's newer UCA-1400 collations (id 2048+) - there's
+		// no way to recover which of its many language-variant/pad-mode
+		// names this specific id is (see uca1400Charset), so this can
+		// only state the charset, not COLLATE=<the real collation>.
+		fmt.Fprintf(&b, " DEFAULT CHARSET=%s", c.name)
 	}
 	b.WriteString(";\n")
 	return b.String()

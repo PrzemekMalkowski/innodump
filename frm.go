@@ -407,7 +407,7 @@ func frmColumnTypeText(c *ddColumnJSON, f frmField) string {
 	}
 	charLen := func() uint32 {
 		maxBytes := 1
-		if cl, ok := collationTable[c.CollationID]; ok && cl.max > 0 {
+		if cl, ok := collationInfoFor(c.CollationID); ok && cl.max > 0 {
 			maxBytes = cl.max
 		}
 		return c.CharLength / uint32(maxBytes)
