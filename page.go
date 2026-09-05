@@ -340,8 +340,8 @@ func (s *Space) ReadIndexPage(pageNo uint32, shape zipIndexShape) ([]byte, error
 // --- Page corruption detection ---
 //
 // Cross-checked against BlockReporter::is_corrupted (storage/innobase/buf/
-// checksum.cc) in the mysql-server source. This implements the two checks
-// that cover the overwhelming majority of real installations:
+// checksum.cc) in the mysql-server source. This implements the checks that
+// cover the overwhelming majority of real installations:
 //
 //   - the LSN consistency check (always done, independent of checksum
 //     algorithm): the low 4 bytes of the FIL_PAGE_LSN field must equal the
@@ -350,14 +350,70 @@ func (s *Space) ReadIndexPage(pageNo uint32, shape zipIndexShape) ([]byte, error
 //     default since 5.7), which is CRC-32C (Castagnoli), NOT the plain CRC-32
 //     zlib/gzip use - confirmed empirically against real pages before
 //     relying on it here.
+//   - the legacy "innodb" checksum algorithm (the pre-5.7 default, still
+//     seen on 5.6 - see buf_calc_page_new_checksum/buf_calc_page_old_checksum
+//     in buf0checksum.cc and ut_fold_binary/ut_fold_ulint_pair in ut0rnd.ic):
+//     a custom, non-cryptographic hash, computed twice - once ("new") over
+//     the same two byte ranges the crc32 algorithm covers, folded together
+//     with a second ("old", historically the *only* range checked, back
+//     when InnoDB's checksum covered just the page header) over just the
+//     first 26 bytes. Both are plain sums/XORs/shifts on unsigned 64-bit
+//     ints (ulint on a 64-bit server) with no periodic masking, only a
+//     final "& 0xFFFFFFFF" - reproduced here with Go's uint64, whose
+//     wraparound-on-overflow matches C's unsigned overflow exactly. Hand-
+//     verified byte-for-byte against a real Percona Server 5.6.47 page
+//     before trusting it.
 //
-// Not implemented: the legacy "innodb" checksum algorithm (a custom Fletcher
-// -like hash, pre-5.7 default) and page-compressed (zlib) checksums, which
-// are out of scope anyway (v1 rejects compressed tablespaces in OpenSpace).
-// A tablespace still using innodb_checksum_algorithm=innodb will report
-// false corruption here; --skip-corrupted or a real innochecksum run can
-// tell the two apart.
+// Not implemented: page-compressed (zlib) checksums, out of scope anyway
+// (v1 rejects compressed tablespaces in OpenSpace).
 const bufNoChecksumMagic = 0xDEADBEEF
+
+// ut0rnd.ic's UT_HASH_RANDOM_MASK/UT_HASH_RANDOM_MASK2 - fixed constants
+// baked into ut_fold_ulint_pair, unchanged across every InnoDB version that
+// still supports the legacy "innodb" checksum algorithm.
+const (
+	utHashRandomMask  = 1463735687
+	utHashRandomMask2 = 1653893711
+)
+
+// utFoldULintPair reproduces ut_fold_ulint_pair(n1, n2) (ut0rnd.ic): a
+// non-cryptographic hash-combining step, computed in 64-bit unsigned
+// arithmetic with no masking of its own - the overflow wraparound is
+// deliberate and part of the hash, and Go's uint64 wraps the same way C's
+// unsigned long does on a 64-bit server.
+func utFoldULintPair(n1, n2 uint64) uint64 {
+	return ((((n1 ^ n2 ^ utHashRandomMask2) << 8) + n1) ^ utHashRandomMask) + n2
+}
+
+// utFoldBinary reproduces ut_fold_binary(str, len) (ut0rnd.ic): folds b's
+// bytes together one at a time via utFoldULintPair.
+func utFoldBinary(b []byte) uint64 {
+	var fold uint64
+	for _, c := range b {
+		fold = utFoldULintPair(fold, uint64(c))
+	}
+	return fold
+}
+
+// bufCalcPageNewChecksum reproduces buf_calc_page_new_checksum (the value
+// stored in FIL_PAGE_SPACE_OR_CHKSUM, page[0:4]) for the legacy "innodb"
+// checksum algorithm: the same two byte ranges (page[4:26] and
+// page[38:n-8]) the crc32 algorithm folds together below, but combined by
+// summing (not XOR-ing) two ut_fold_binary hashes instead of CRC-32C.
+func bufCalcPageNewChecksum(page []byte) uint32 {
+	n := len(page)
+	return uint32(utFoldBinary(page[4:26]) + utFoldBinary(page[38:n-8]))
+}
+
+// bufCalcPageOldChecksum reproduces buf_calc_page_old_checksum (the value
+// stored in the page's last-8-bytes trailer, page[n-8:n-4]) for the legacy
+// "innodb" checksum algorithm: a ut_fold_binary hash over only the first 26
+// bytes - a holdover from InnoDB versions before 4.0.14/4.1.1, where the
+// checksum only ever looked at the page header, still computed and stored
+// today for backward read-compatibility.
+func bufCalcPageOldChecksum(page []byte) uint32 {
+	return uint32(utFoldBinary(page[0:26]))
+}
 
 var crc32cTable = crc32.MakeTable(crc32.Castagnoli)
 
@@ -440,7 +496,19 @@ func checkPage(page []byte, compressed, fullCRC32 bool) pageCheck {
 	if f1 == f2 && f1 == c1^c2 {
 		return pageCheck{OK: true}
 	}
-	return pageCheck{Reason: fmt.Sprintf("checksum mismatch (stored %08x/%08x, computed crc32c %08x)", f1, f2, c1^c2)}
+	// The legacy "innodb" checksum algorithm (pre-5.7 default, still the
+	// default on 5.6): reproduces buf_page_is_checksum_valid_innodb's two
+	// independent checks - f2 (the trailer, "old" field) must match either
+	// the raw LSN low bytes (very old InnoDB versions wrote nothing else)
+	// or buf_calc_page_old_checksum, and f1 (the header, "new" field) must
+	// be either 0 (pre-4.0.14/4.1.1) or buf_calc_page_new_checksum.
+	lsnLow4 := binary.BigEndian.Uint32(page[filPageLSN : filPageLSN+4])
+	oldSum := bufCalcPageOldChecksum(page)
+	newSum := bufCalcPageNewChecksum(page)
+	if (f2 == lsnLow4 || f2 == oldSum) && (f1 == 0 || f1 == newSum) {
+		return pageCheck{OK: true}
+	}
+	return pageCheck{Reason: fmt.Sprintf("checksum mismatch (stored %08x/%08x, computed crc32c %08x, legacy innodb %08x/%08x)", f1, f2, c1^c2, newSum, oldSum)}
 }
 
 // --- FIL header accessors (operate on a single page's bytes) ---

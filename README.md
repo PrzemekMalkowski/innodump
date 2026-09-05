@@ -266,15 +266,14 @@ intact. If that pointer is itself missing or unusable, the walk ends there
 (not as an error — you keep every row decoded up to that point). The final
 summary line reports how many pages were skipped this way.
 
-Only the `crc32` checksum algorithm is verified (the default since MySQL
-5.7 and by far the most common in practice); a tablespace still using the
-legacy `innodb_checksum_algorithm=innodb` will report false corruption —
-cross-check with `innochecksum` if `--skip-corrupted` triggers unexpectedly
-often. A `ROW_FORMAT=COMPRESSED` page's checksum uses a different
-algorithm this tool doesn't implement, so only the cheaper "is this an
-unallocated, all-zero page" check runs for one — a genuinely corrupted
-compressed page will likely surface as a decode error instead of a clean
-"checksum mismatch" one.
+Both the `crc32` checksum algorithm (the default since MySQL 5.7, and
+MariaDB's own `full_crc32` format - see "MariaDB support", above) and the
+legacy `innodb` algorithm (MySQL 5.6's own default, a custom hash
+predating `crc32` entirely) are verified. A `ROW_FORMAT=COMPRESSED` page's
+checksum uses a different algorithm this tool doesn't implement, so only
+the cheaper "is this an unallocated, all-zero page" check runs for one —
+a genuinely corrupted compressed page will likely surface as a decode
+error instead of a clean "checksum mismatch" one.
 
 ## Progress
 
@@ -322,10 +321,10 @@ covering `INT`/`VARCHAR`/`DECIMAL`/`DATETIME`/`TINYINT`/`TEXT`/`ENUM`/`SET`,
 a composite `PRIMARY KEY`, `UNIQUE`/plain secondary indexes, an
 `AUTO_INCREMENT` column, `FLOAT UNSIGNED`, `NULL`s, and multi-byte
 (`utf8mb4`) string data. Reload-and-diff came back byte-for-byte identical
-in every case (MySQL 5.6's own default checksum algorithm predates `crc32`
-and isn't implemented here either — see "Corrupted pages" — so a real 5.6
-file needs `SET GLOBAL innodb_checksum_algorithm=crc32` and a rewrite, e.g.
-`ALTER TABLE ... ENGINE=InnoDB`, before this tool can read it).
+in every case, including a real Percona Server 5.6.47 table using the
+legacy `innodb` checksum algorithm (5.6's own default, and the first real
+file this tool hand-verified that algorithm's two hash formulas against —
+see "Corrupted pages").
 
 Corruption handling was validated by flipping a byte in a real leaf page of
 a 2,000-row, 72-leaf-page table: the default run stopped with the exact
