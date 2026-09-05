@@ -1,17 +1,24 @@
 # 🗄️ ibd-extractor
 
 `ibd-extractor` is an offline reader for a single MySQL InnoDB tablespace
-file (`table.ibd`, file-per-table mode) — MySQL 8.0/8.4, MySQL 5.6/5.7 or
-MariaDB given the table's `.frm` file alongside it (see "MySQL 5.6/5.7
-(.frm) support" and "MariaDB support", below). Given `table.ibd`, it
-produces:
+file (`table.ibd`, file-per-table mode, or a shared/common tablespace
+holding several tables — see `--table` below) — MySQL 8.0/8.4, MySQL
+5.6/5.7 or MariaDB given the table's `.frm` file alongside it (see "MySQL
+5.6/5.7 (.frm) support" and "MariaDB support", below). Given `table.ibd`,
+it produces, under `./sqldump/` by default:
 
-- `table-schema.sql` — a best-effort `CREATE TABLE` statement, reconstructed
-  from the table's own embedded dictionary information (SDI), or its `.frm`
-  file for a pre-8.0 table.
-- `table-data.sql` — one `INSERT INTO ... VALUES (...);` statement per live
-  row, decoded by walking the table's clustered index (its B+tree) directly
-  in the file.
+- `schema.table-schema.sql` — a best-effort `CREATE TABLE` statement,
+  reconstructed from the table's own embedded dictionary information (SDI),
+  or its `.frm` file for a pre-8.0 table.
+- `schema.table-data.sql` — one `INSERT INTO ... VALUES (...);` statement
+  per live row, decoded by walking the table's clustered index (its B+tree)
+  directly in the file.
+
+Output files are named after the table's own schema and name (as recorded
+in its dictionary information, not the `.ibd` file's own filename) since a
+shared/common tablespace's single `.ibd` file can hold more than one
+table — extracting `mysql.ibd`'s `user` table produces `mysql.user-schema.sql`
+/`mysql.user-data.sql`, not `mysql-schema.sql`/`mysql-data.sql`.
 
 It reads the file directly and does not connect to a running server, so
 it's safe to point at a copy of a `.ibd` file from a node that is up or
@@ -50,10 +57,11 @@ ibd-extractor --file /path/to/table.ibd [options]
 | Flag | Description |
 |------|-------------|
 | `--file PATH` | Path to the `.ibd` file (required). |
-| `--out-dir DIR` | Directory for the two output files (default: the current directory). |
-| `--table NAME` | Which table to extract, if the file's SDI unexpectedly holds more than one. |
+| `--out-dir DIR` | Directory for the two output files (default: `./sqldump`, created if it doesn't exist). |
+| `--table NAME` | Which table to extract, if the file holds more than one - always required for a shared/common tablespace. |
 | `--limit N` | Stop after N rows (0 = all). |
 | `--ddl-only` | Only write the schema file; skip walking the table's data entirely. |
+| `--yes` | Overwrite existing output files without prompting (also honored via `YES=1`). Without it, an existing output file triggers an interactive y/N prompt, or - with no terminal to prompt on - a refusal naming the file(s) in question. |
 | `--skip-corrupted` | On a corrupted leaf page, note it and carry on from the next page instead of stopping. |
 | `--no-progress` | Never draw the progress bar on stderr (also honored via `NO_PROGRESS=1`). |
 | `--verbose` | Print extra file/table details: page size, FSP flags, the MySQL version and dictionary/SDI versions that wrote the file, and index/column counts. |

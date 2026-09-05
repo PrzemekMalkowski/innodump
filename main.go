@@ -1,11 +1,14 @@
 // ibd-extractor - offline schema+data extraction from a MySQL 8.0/8.4, or
 // 5.6/5.7, InnoDB .ibd file.
 //
-// Given table.ibd, produces table-schema.sql (a best-effort CREATE TABLE,
-// reconstructed from the tablespace's embedded SDI, or its .frm file for a
-// pre-8.0 table - see frm.go) and table-data.sql (one INSERT statement per
-// live row, decoded by walking the clustered index's B+tree directly out
-// of the file - no server involved).
+// Given table.ibd, produces ./sqldump/schema.table-schema.sql (a best
+// -effort CREATE TABLE, reconstructed from the tablespace's embedded SDI,
+// or its .frm file for a pre-8.0 table - see frm.go) and
+// ./sqldump/schema.table-data.sql (one INSERT statement per live row,
+// decoded by walking the clustered index's B+tree directly out of the
+// file - no server involved). Output files are named after the table
+// itself rather than the .ibd file, since a shared/common tablespace can
+// hold more than one table under a single .ibd (see --table below).
 //
 // Scope (v1): MySQL 8.0.16+ / 8.4.x tablespaces, ROW_FORMAT=DYNAMIC,
 // COMPACT, REDUNDANT, or COMPRESSED, non-partitioned (INSTANT ADD/DROP
@@ -33,6 +36,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -44,18 +48,19 @@ import (
 
 const (
 	appName = "ibd-extractor"
-	version = "0.4.1"
+	version = "0.4.2"
 )
 
 var (
 	filePath      = flag.String("file", "", "Path to the .ibd file to extract")
-	outDir        = flag.String("out-dir", "", "Directory for the output .sql files (default: the current directory)")
+	outDir        = flag.String("out-dir", "", "Directory for the output .sql files (default: ./sqldump, created if it doesn't exist)")
 	tableName     = flag.String("table", "", "Table name to extract, if the SDI holds more than one")
 	limitRows     = flag.Int("limit", 0, "Stop after this many rows (0 = all)")
 	ddlOnly       = flag.Bool("ddl-only", false, "Only write the schema file; skip walking the table's data entirely")
 	skipCorrupted = flag.Bool("skip-corrupted", false, "On a corrupted leaf page, note it and try to carry on from the next page instead of stopping")
 	noProgress    = flag.Bool("no-progress", false, "Never draw the progress bar on stderr (also honored: NO_PROGRESS=1)")
 	verbose       = flag.Bool("verbose", false, "Print extra .ibd/table details: page size, FSP flags, the MySQL version and dictionary/SDI versions that wrote the file, index/column counts")
+	yes           = flag.Bool("yes", false, "Overwrite existing output files without prompting (also honored: YES=1)")
 	showVersion   = flag.Bool("version", false, "Print version and exit")
 	dumpPage      = flag.Int("dump-page", -1, "debug: hex-dump one page and its record chain, then exit")
 	debug         = flag.Bool("debug", false, "debug: print each record's decoded field byte-ranges as they're read")
@@ -70,7 +75,7 @@ func main() {
 	if *filePath == "" {
 		fmt.Printf("%s %s\n", appName, version)
 		fmt.Printf("Usage: %s --file /path/to/table.ibd [--out-dir DIR] [--table NAME] [--limit N]\n", appName)
-		fmt.Println("       [--ddl-only] [--skip-corrupted] [--no-progress] [--verbose] [--debug] [--dump-page N] [--version]")
+		fmt.Println("       [--ddl-only] [--skip-corrupted] [--no-progress] [--verbose] [--yes] [--debug] [--dump-page N] [--version]")
 		os.Exit(1)
 	}
 	if err := run(); err != nil {
@@ -150,13 +155,29 @@ func run() error {
 		fmt.Printf("Physical fields: %d (%d output)\n", len(t.PhysicalFields), len(OutputColumns(t)))
 	}
 
-	base := strings.TrimSuffix(filepath.Base(*filePath), filepath.Ext(*filePath))
+	// Named after the table itself (schema.table), not the .ibd file's own
+	// base name - the two differ whenever a tablespace holds more than one
+	// table, e.g. a shared/common tablespace like MySQL's own mysql.ibd,
+	// where every table in the instance's data dictionary lives in the one
+	// file and --table picks which one to extract.
+	base := outputBaseName(t.SchemaRef, t.Name)
 	dir := *outDir
 	if dir == "" {
-		dir = "."
+		dir = "sqldump"
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("creating output directory %s: %w", dir, err)
 	}
 	schemaPath := filepath.Join(dir, base+"-schema.sql")
 	dataPath := filepath.Join(dir, base+"-data.sql")
+
+	wantPaths := []string{schemaPath}
+	if !*ddlOnly {
+		wantPaths = append(wantPaths, dataPath)
+	}
+	if err := confirmOverwrite(wantPaths, *yes || os.Getenv("YES") != ""); err != nil {
+		return err
+	}
 
 	outCols := OutputColumns(t)
 	if len(outCols) == 0 {
@@ -302,6 +323,54 @@ func formatMySQLVersion(id uint32) string {
 		return "unknown"
 	}
 	return fmt.Sprintf("%d.%d.%d", id/10000, (id/100)%100, id%100)
+}
+
+// outputBaseName builds the "schema.table" base name output files are named
+// after. schemaRef is usually already filesystem-safe (it's a real database
+// name), but "/" is replaced defensively since it would otherwise be read as
+// a directory separator by filepath.Join.
+func outputBaseName(schemaRef, table string) string {
+	safe := func(s string) string { return strings.ReplaceAll(s, "/", "_") }
+	if schemaRef == "" {
+		return safe(table)
+	}
+	return safe(schemaRef) + "." + safe(table)
+}
+
+// confirmOverwrite checks paths for ones that already exist and, unless yes
+// is set, asks before letting the caller overwrite them: interactively (a y
+// /N prompt on stdin) when stdin is a real terminal, or by refusing outright
+// otherwise - a non-interactive run (e.g. a script looping over many tables)
+// has no one to answer a prompt, so silently clobbering an existing file
+// would be the wrong default and hanging on a read that never completes
+// would be worse.
+func confirmOverwrite(paths []string, yes bool) error {
+	if yes {
+		return nil
+	}
+	var existing []string
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			existing = append(existing, p)
+		}
+	}
+	if len(existing) == 0 {
+		return nil
+	}
+	if !isTTY(os.Stdin) {
+		return fmt.Errorf("output file(s) already exist: %s (pass --yes, or set YES=1, to overwrite)", strings.Join(existing, ", "))
+	}
+	fmt.Printf("The following output file(s) already exist:\n")
+	for _, p := range existing {
+		fmt.Printf("  %s\n", p)
+	}
+	fmt.Printf("Overwrite? [y/N]: ")
+	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	answer = strings.TrimSpace(answer)
+	if answer != "y" && answer != "Y" && !strings.EqualFold(answer, "yes") {
+		return fmt.Errorf("not overwriting existing output file(s): %s", strings.Join(existing, ", "))
+	}
+	return nil
 }
 
 func pickTable(tables []*ddTableJSON, ibdPath, want string) (*ddTableJSON, error) {
