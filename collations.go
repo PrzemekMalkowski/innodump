@@ -157,3 +157,40 @@ func uca1400Charset(id uint64) (collationInfo, bool) {
 	}
 	return uca1400CharsetBlocks[block], true
 }
+
+// primaryCollationIDs are the collation ids MySQL's own compiled charset
+// tables (strings/ctype-*.cc, the MY_CS_PRIMARY flag) mark as a charset's
+// "primary" (default) collation - the one SHOW CREATE TABLE's own DEFAULT
+// CHARSET=.../CHARACTER SET ... clauses omit an explicit COLLATE for,
+// unless (column-level only) it was named explicitly in the original
+// CREATE/ALTER TABLE (see GenerateDDL in sqlout.go, and Column.
+// IsExplicitCollation's comment in schema.go) - or collationUtf8mb40900AiCi,
+// which needs its own extra special-casing on top of this map; see its
+// own comment.
+//
+// A collation id absent from this map (an obscure or newer one this list
+// hasn't been extended for) is conservatively treated as "not primary" -
+// this can only make GenerateDDL show an explicit COLLATE a real server
+// would have omitted, never the reverse, so the generated DDL stays a
+// correct (if occasionally more verbose than strictly necessary) CREATE
+// TABLE either way.
+var primaryCollationIDs = map[uint64]bool{
+	1: true, 3: true, 4: true, 6: true, 7: true, 8: true, 9: true, 10: true,
+	11: true, 12: true, 13: true, 16: true, 18: true, 19: true, 22: true,
+	24: true, 25: true, 26: true, 28: true, 30: true, 32: true, 33: true,
+	35: true, 36: true, 37: true, 38: true, 39: true, 40: true, 41: true,
+	51: true, 54: true, 56: true, 57: true, 59: true, 60: true, 63: true,
+	92: true, 95: true, 97: true, 248: true,
+	collationUtf8mb40900AiCi: true, // see this constant's own comment
+}
+
+// collationUtf8mb40900AiCi (utf8mb4_0900_ai_ci) is MySQL 8.0's default
+// collation, and - despite being flagged MY_CS_PRIMARY like any other
+// charset's default - real MySQL always shows an explicit COLLATE for it
+// anyway (sql_show.cc special-cases exactly this collation, on top of the
+// general "not primary" rule, in both show_create_table and
+// print_create_fields_stmt): always at the table level, but only at the
+// column level when the column's own collation is this one AND the
+// table's own default collation is NOT - see GenerateDDL's use of this
+// constant in sqlout.go for exactly where each rule applies.
+const collationUtf8mb40900AiCi = 255

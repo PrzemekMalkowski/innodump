@@ -6,7 +6,34 @@ package main
 import (
 	"encoding/binary"
 	"fmt"
+	"runtime"
+	"sync"
 )
+
+// truncatedReason returns a "this file is truncated" explanation for
+// pageNo if the file doesn't actually hold that many pages at all, or ""
+// if it does (a page the file genuinely holds failing to read cleanly, or
+// failing validation, means something else - a damaged filesystem, or
+// real on-disk corruption - and is handled separately by each caller).
+func truncatedReason(sp *Space, pageNo uint32) string {
+	if pageNo < sp.NumPages {
+		return ""
+	}
+	return fmt.Sprintf("page %d is past the end of the file (it holds only %d page(s)) - "+
+		"the file looks truncated (not fully copied), rather than corrupted", pageNo, sp.NumPages)
+}
+
+// readPageOrTruncated is Space.ReadPage with a clearer error for the
+// specific, common case of a page number the file doesn't hold at all
+// (see truncatedReason) - used where that's always fatal regardless of
+// --skip-corrupted (leftmostLeaf, below); collectBatch handles the same
+// condition itself, since there it's instead recoverable.
+func readPageOrTruncated(sp *Space, pageNo uint32) ([]byte, error) {
+	if reason := truncatedReason(sp, pageNo); reason != "" {
+		return nil, fmt.Errorf("%s", reason)
+	}
+	return sp.ReadPage(pageNo)
+}
 
 // leftmostLeaf descends from root to the leftmost page at level 0, reading
 // the child page number out of the first (leftmost) non-leaf record on each
@@ -16,7 +43,7 @@ import (
 // down to the correct leftmost leaf.
 func leftmostLeaf(sp *Space, t *Table) (uint32, error) {
 	shape := tableZipShape(t)
-	raw, err := sp.ReadPage(t.RootPage)
+	raw, err := readPageOrTruncated(sp, t.RootPage)
 	if err != nil {
 		return 0, err
 	}
@@ -49,7 +76,7 @@ func leftmostLeaf(sp *Space, t *Table) (uint32, error) {
 			return 0, fmt.Errorf("page %d: %w", cur, err)
 		}
 		level := pageGetLevel(page)
-		raw, err = sp.ReadPage(child)
+		raw, err = readPageOrTruncated(sp, child)
 		if err != nil {
 			return 0, err
 		}
@@ -120,8 +147,19 @@ type RowOrError struct {
 
 // CorruptPage describes one leaf page that failed validation.
 type CorruptPage struct {
-	PageNo uint32
-	Reason string
+	PageNo    uint32
+	Reason    string
+	Truncated bool // pageNo is past the end of the file itself - see collectBatch
+}
+
+// pageEvent is one leaf page's outcome, as collected by WalkRows' sequential
+// batch-building loop: either a corrupt-page report (see CorruptPage) or the
+// (possibly still being decoded, in parallel - see decodeBatch) rows found
+// on an otherwise-good page.
+type pageEvent struct {
+	corrupt *CorruptPage
+	page    []byte // this page's decompressed bytes; nil for a corrupt event
+	rows    []RowOrError
 }
 
 // WalkRows decodes every live (non-delete-marked) row in the clustered
@@ -136,17 +174,91 @@ type CorruptPage struct {
 // pointer (corruption is often localized to the page body, leaving the
 // header intact) to reach the next page, stopping only if that pointer is
 // itself missing or unusable. onCorrupt may be nil.
-func WalkRows(sp *Space, t *Table, outCols []*Column, skipCorrupted bool, onCorrupt func(CorruptPage), fn func(RowOrError) bool) error {
+//
+// Reading and validating a page, and following its FIL_PAGE_NEXT pointer to
+// the next one, all happen sequentially, exactly as before (that's what
+// makes --skip-corrupted's "resume from the next page" strategy, and the
+// exact page/row order onCorrupt and fn see, well-defined). What's
+// parallel is the CPU-bound part - decodeOneRow's per-column decode and
+// (for --format=sql/tsv) literal/field rendering - which this collects a
+// batch of up to GOMAXPROCS pages at a time (decodeBatch) to spread across
+// every available core, before handing results to onCorrupt/fn ONE PAGE AT
+// A TIME, strictly in the same page and row order the old fully-sequential
+// version used - so this is purely a speedup: every ordering guarantee,
+// and the exact set of rows/pages onCorrupt and fn are called for, is
+// unchanged.
+func WalkRows(sp *Space, t *Table, outCols []*Column, format outputFormat, skipCorrupted bool, onCorrupt func(CorruptPage), fn func(RowOrError) bool) error {
 	leaf, err := leftmostLeaf(sp, t)
 	if err != nil {
 		return fmt.Errorf("finding the leftmost leaf page: %w", err)
 	}
 	shape := tableZipShape(t)
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+
 	pageNo := leaf
 	for pageNo != filNull {
-		raw, err := sp.ReadPage(pageNo)
+		batch, fatalErr := collectBatch(sp, t, shape, skipCorrupted, workers, &pageNo)
+		decodeBatch(sp, t, outCols, format, batch)
+
+		for _, ev := range batch {
+			if ev.corrupt != nil {
+				if onCorrupt != nil {
+					onCorrupt(*ev.corrupt)
+				}
+				continue
+			}
+			for _, roe := range ev.rows {
+				if !fn(roe) {
+					return nil // fn asked to stop - not an error
+				}
+			}
+		}
+		if fatalErr != nil {
+			return fatalErr
+		}
+	}
+	return nil
+}
+
+// collectBatch reads and validates up to maxPages leaf pages starting at
+// *pageNo, following FIL_PAGE_NEXT exactly as the original single-threaded
+// WalkRows did (see its comment for the corrupt-page/--skip-corrupted
+// rules), and returns one pageEvent per page - a live-row-offset list for
+// decodeBatch to fill in, or a corrupt-page report ready to hand to
+// onCorrupt as-is. *pageNo is left at filNull once the walk has genuinely
+// ended (chain exhausted, or an unrecoverable corrupt page with
+// --skip-corrupted); otherwise it's the next page collectBatch itself
+// hasn't read yet. A non-nil returned error is always the *last* thing
+// that happened (a fatal corrupt page) - every event before it in the
+// returned slice is still good and must still reach onCorrupt/fn.
+func collectBatch(sp *Space, t *Table, shape zipIndexShape, skipCorrupted bool, maxPages int, pageNo *uint32) ([]pageEvent, error) {
+	batch := make([]pageEvent, 0, maxPages)
+	for len(batch) < maxPages && *pageNo != filNull {
+		pn := *pageNo
+		if reason := truncatedReason(sp, pn); reason != "" {
+			// The file itself doesn't hold this page at all - not a bad
+			// checksum or a wrong page type on a page that IS there, but
+			// the file ending before it altogether. Most often this means
+			// the copy was interrupted partway through (see the README's
+			// "Truncated files" section) rather than genuine corruption;
+			// either way there's no header here to read a next-page
+			// pointer from, so - unlike an ordinary corrupt page - this is
+			// always where the walk ends, never something to skip past.
+			*pageNo = filNull
+			if !skipCorrupted {
+				return batch, fmt.Errorf("page %d (index %q, id %d): %s", pn, t.IndexName, t.IndexID, reason)
+			}
+			cp := CorruptPage{PageNo: pn, Reason: reason, Truncated: true}
+			batch = append(batch, pageEvent{corrupt: &cp})
+			return batch, nil
+		}
+		raw, err := sp.ReadPage(pn)
 		if err != nil {
-			return err
+			*pageNo = filNull
+			return batch, err
 		}
 		// Validated against the raw physical bytes throughout, exactly as
 		// for an uncompressed tablespace (see Decompress's comment):
@@ -165,39 +277,64 @@ func WalkRows(sp *Space, t *Table, outCols []*Column, skipCorrupted bool, onCorr
 		}
 		if reason != "" {
 			if !skipCorrupted {
-				return fmt.Errorf("page %d (index %q, id %d): %s", pageNo, t.IndexName, t.IndexID, reason)
+				*pageNo = filNull
+				return batch, fmt.Errorf("page %d (index %q, id %d): %s", pn, t.IndexName, t.IndexID, reason)
 			}
-			if onCorrupt != nil {
-				onCorrupt(CorruptPage{PageNo: pageNo, Reason: reason})
-			}
+			cp := CorruptPage{PageNo: pn, Reason: reason}
+			batch = append(batch, pageEvent{corrupt: &cp})
 			next := filNextPage(raw)
-			if next == filNull || next == pageNo || next >= sp.NumPages {
-				return nil // no usable way to keep going from here
+			if next == filNull || next == pn || next >= sp.NumPages {
+				*pageNo = filNull // no usable way to keep going from here
+				return batch, nil
 			}
-			pageNo = next
+			*pageNo = next
 			continue
 		}
-		cont := true
+
+		var offs []uint32
 		walkRecords(page, sp.PageSize, func(recOff uint32) bool {
-			if recDeleted(page, recOff) {
-				return true
-			}
-			row, err := decodeOneRow(sp, page, recOff, t, outCols)
-			if !fn(RowOrError{PageNo: pageNo, RecOff: recOff, Row: row, Err: err}) {
-				cont = false
-				return false
+			if !recDeleted(page, recOff) {
+				offs = append(offs, recOff)
 			}
 			return true
 		})
-		if !cont {
-			return nil
+		ev := pageEvent{page: page, rows: make([]RowOrError, len(offs))}
+		for i, recOff := range offs {
+			ev.rows[i] = RowOrError{PageNo: pn, RecOff: recOff}
 		}
-		pageNo = filNextPage(page)
+		batch = append(batch, ev)
+		*pageNo = filNextPage(page)
 	}
-	return nil
+	return batch, nil
 }
 
-func decodeOneRow(sp *Space, page []byte, recOff uint32, t *Table, outCols []*Column) (row *Row, err error) {
+// decodeBatch fills in every rows[i].Row/Err left blank by collectBatch (a
+// corrupt-page event has none to fill), one goroutine per page, since each
+// page's records only ever read that page's own bytes plus (for an
+// off-page BLOB/TEXT column) further pages fetched through sp - and
+// Space.ReadPage/ReadAt, and every column decoder, only ever read, never
+// share or mutate, state across a call - see values.go/lob.go. Returns
+// once every page in the batch has finished decoding.
+func decodeBatch(sp *Space, t *Table, outCols []*Column, format outputFormat, batch []pageEvent) {
+	var wg sync.WaitGroup
+	for i := range batch {
+		ev := &batch[i]
+		if ev.corrupt != nil || len(ev.rows) == 0 {
+			continue
+		}
+		wg.Add(1)
+		go func(ev *pageEvent) {
+			defer wg.Done()
+			for j := range ev.rows {
+				row, err := decodeOneRow(sp, ev.page, ev.rows[j].RecOff, t, outCols, format)
+				ev.rows[j].Row, ev.rows[j].Err = row, err
+			}
+		}(ev)
+	}
+	wg.Wait()
+}
+
+func decodeOneRow(sp *Space, page []byte, recOff uint32, t *Table, outCols []*Column, format outputFormat) (row *Row, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			row, err = nil, fmt.Errorf("panic decoding record: %v", r)
@@ -228,11 +365,11 @@ func decodeOneRow(sp *Space, page []byte, recOff uint32, t *Table, outCols []*Co
 		var err error
 		switch {
 		case fr.Null:
-			v = "NULL"
+			v = nullLiteral(format)
 		case fr.Default:
-			v, err = decodeInstantDefault(col)
+			v, err = decodeInstantDefault(col, format)
 		default:
-			v, err = decodeField(sp, col, page, fr)
+			v, err = decodeField(sp, col, page, fr, format)
 		}
 		if err != nil {
 			return nil, err

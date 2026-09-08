@@ -168,17 +168,73 @@ type ddIndexJSON struct {
 }
 
 type ddTableJSON struct {
-	Name          string         `json:"name"`
-	Hidden        uint32         `json:"hidden"`
-	Columns       []ddColumnJSON `json:"columns"`
-	SchemaRef     string         `json:"schema_ref"`
-	SePrivateID   uint64         `json:"se_private_id"`
-	Comment       string         `json:"comment"`
-	SePrivateData string         `json:"se_private_data"`
-	RowFormat     uint32         `json:"row_format"`
-	PartitionType uint32         `json:"partition_type"`
-	CollationID   uint64         `json:"collation_id"`
-	Indexes       []ddIndexJSON  `json:"indexes"`
+	Name          string             `json:"name"`
+	Hidden        uint32             `json:"hidden"`
+	Columns       []ddColumnJSON     `json:"columns"`
+	SchemaRef     string             `json:"schema_ref"`
+	SePrivateID   uint64             `json:"se_private_id"`
+	Comment       string             `json:"comment"`
+	SePrivateData string             `json:"se_private_data"`
+	RowFormat     uint32             `json:"row_format"`
+	PartitionType uint32             `json:"partition_type"`
+	CollationID   uint64             `json:"collation_id"`
+	Indexes       []ddIndexJSON      `json:"indexes"`
+	ForeignKeys   []ddForeignKeyJSON `json:"foreign_keys"`
+}
+
+// ddForeignKeyElementJSON is one column pair of a foreign key -
+// Foreign_key_element in the DD. ColumnOpx (like ddIndexElementJSON's)
+// indexes directly into the referencing table's own raw "columns" array
+// (colsByOpx in BuildTable); ReferencedColumnName is already the
+// referenced table's column name as plain text, since that table's own
+// column array isn't available here to index into.
+type ddForeignKeyElementJSON struct {
+	ColumnOpx            uint32 `json:"column_opx"`
+	ReferencedColumnName string `json:"referenced_column_name"`
+}
+
+// ddForeignKeyJSON is one FOREIGN KEY constraint - Foreign_key in the DD
+// (sql/dd/types/foreign_key.h). UpdateRule/DeleteRule are Foreign_key::
+// enum_rule (1=NO_ACTION/omit the clause, 2=RESTRICT, 3=CASCADE, 4=SET
+// NULL, 5=SET DEFAULT - see ddFKRuleText). match_option is deliberately not
+// modeled: real MySQL parses a MATCH clause but never acts on it or prints
+// it back in SHOW CREATE TABLE (see print_foreign_key_info in sql_show.cc),
+// so this tool doesn't reproduce it either.
+type ddForeignKeyJSON struct {
+	Name                      string                    `json:"name"`
+	UpdateRule                uint32                    `json:"update_rule"`
+	DeleteRule                uint32                    `json:"delete_rule"`
+	ReferencedTableSchemaName string                    `json:"referenced_table_schema_name"`
+	ReferencedTableName       string                    `json:"referenced_table_name"`
+	Elements                  []ddForeignKeyElementJSON `json:"elements"`
+}
+
+// Foreign_key::enum_rule (foreign_key.h in the DD).
+const (
+	ddFKRuleNoAction   = 1
+	ddFKRuleRestrict   = 2
+	ddFKRuleCascade    = 3
+	ddFKRuleSetNull    = 4
+	ddFKRuleSetDefault = 5
+)
+
+// ddFKRuleText renders one Foreign_key::enum_rule value as SHOW CREATE
+// TABLE's own "ON DELETE"/"ON UPDATE" clause does (print_foreign_key_info
+// in sql_show.cc) - "" (omit the clause entirely) for the implicit
+// NO_ACTION default.
+func ddFKRuleText(rule uint32) string {
+	switch rule {
+	case ddFKRuleRestrict:
+		return "RESTRICT"
+	case ddFKRuleCascade:
+		return "CASCADE"
+	case ddFKRuleSetNull:
+		return "SET NULL"
+	case ddFKRuleSetDefault:
+		return "SET DEFAULT"
+	default:
+		return ""
+	}
 }
 
 // Index::enum_index_type (Index.h in the DD).
@@ -212,11 +268,20 @@ type Column struct {
 	DatetimePrec    uint32
 	TypeText        string // column_type_utf8, e.g. "varchar(255)"
 	CollationID     uint64
-	Comment         string
-	GenExpr         string
-	Elements        []string // decoded ENUM/SET labels, 1-indexed by position
-	HasDefault      bool
-	DefaultText     string
+	// IsExplicitCollation is is_explicit_collation from the SDI: whether this
+	// column's CHARACTER SET/COLLATE was named explicitly at CREATE/ALTER
+	// TABLE time, rather than merely inherited from the table's own default.
+	// GenerateDDL (sqlout.go) shows the column's CHARACTER SET/COLLATE
+	// whenever this is true, exactly like SHOW CREATE TABLE does - even if
+	// CollationID happens to already equal the table's own default, as for
+	// a column whose charset/collation were named explicitly but happen to
+	// match anyway.
+	IsExplicitCollation bool
+	Comment             string
+	GenExpr             string
+	Elements            []string // decoded ENUM/SET labels, 1-indexed by position
+	HasDefault          bool
+	DefaultText         string
 
 	Mtype    uint32
 	ColLen   uint32 // storage byte length (pack length)
@@ -288,6 +353,19 @@ type SecondaryIndex struct {
 	Columns           []SecondaryIndexColumn
 }
 
+// ForeignKey is one FOREIGN KEY constraint, for DDL output only (this tool
+// never validates or enforces referential integrity - it just walks the
+// clustered index and reproduces what CREATE TABLE said).
+type ForeignKey struct {
+	Name              string
+	Columns           []*Column // this table's own referencing column(s), in order
+	ReferencedSchema  string
+	ReferencedTable   string
+	ReferencedColumns []string // the other table's column names - not resolved to *Column, since that table's own schema isn't read
+	OnDelete          string   // "" (omit the clause), "RESTRICT", "CASCADE", "SET NULL", or "SET DEFAULT"
+	OnUpdate          string
+}
+
 type Table struct {
 	Name, SchemaRef string
 	RowFormat       uint32
@@ -316,6 +394,7 @@ type Table struct {
 	OldNonDefaultFields int // physical field count of a row predating any instant add
 
 	SecondaryIndexes []*SecondaryIndex
+	ForeignKeys      []*ForeignKey
 
 	// AUTO_INCREMENT: the SDI carries no persisted "next value" (the server
 	// tracks that separately, outside any single tablespace file), so main.go
@@ -533,27 +612,28 @@ func buildColumn(raw ddColumnJSON) (*Column, error) {
 		}
 	}
 	c := &Column{
-		raw:             raw,
-		Name:            raw.Name,
-		DDType:          raw.Type,
-		IsNullable:      raw.IsNullable,
-		IsUnsigned:      raw.IsUnsigned,
-		IsZerofill:      raw.IsZerofill,
-		IsAutoIncrement: raw.IsAutoIncrement,
-		IsVirtual:       raw.IsVirtual,
-		Hidden:          raw.Hidden,
-		CharLength:      raw.CharLength,
-		NumPrec:         raw.NumericPrecision,
-		NumScale:        raw.NumericScale,
-		DatetimePrec:    raw.DatetimePrecision,
-		TypeText:        raw.ColumnTypeUtf8,
-		CollationID:     raw.CollationID,
-		Comment:         raw.Comment,
-		GenExpr:         raw.GenerationExpressionUtf8,
-		Elements:        decodeElements(raw.Elements),
-		HasDefault:      !raw.HasNoDefault && !raw.DefaultValueUtf8Null,
-		DefaultText:     raw.DefaultValueUtf8,
-		IsSystem:        isSystem,
+		raw:                 raw,
+		Name:                raw.Name,
+		DDType:              raw.Type,
+		IsNullable:          raw.IsNullable,
+		IsUnsigned:          raw.IsUnsigned,
+		IsZerofill:          raw.IsZerofill,
+		IsAutoIncrement:     raw.IsAutoIncrement,
+		IsVirtual:           raw.IsVirtual,
+		Hidden:              raw.Hidden,
+		CharLength:          raw.CharLength,
+		NumPrec:             raw.NumericPrecision,
+		NumScale:            raw.NumericScale,
+		DatetimePrec:        raw.DatetimePrecision,
+		TypeText:            raw.ColumnTypeUtf8,
+		CollationID:         raw.CollationID,
+		IsExplicitCollation: raw.IsExplicitCollation,
+		Comment:             raw.Comment,
+		GenExpr:             raw.GenerationExpressionUtf8,
+		Elements:            decodeElements(raw.Elements),
+		HasDefault:          !raw.HasNoDefault && !raw.DefaultValueUtf8Null,
+		DefaultText:         raw.DefaultValueUtf8,
+		IsSystem:            isSystem,
 	}
 	sep := sePropString(raw.SePrivateData)
 	if v, ok := sep["version_added"]; ok {
@@ -804,6 +884,26 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 		}
 		if len(si.Columns) > 0 {
 			t.SecondaryIndexes = append(t.SecondaryIndexes, si)
+		}
+	}
+
+	for _, fk := range raw.ForeignKeys {
+		f := &ForeignKey{
+			Name:             fk.Name,
+			ReferencedSchema: fk.ReferencedTableSchemaName,
+			ReferencedTable:  fk.ReferencedTableName,
+			OnDelete:         ddFKRuleText(fk.DeleteRule),
+			OnUpdate:         ddFKRuleText(fk.UpdateRule),
+		}
+		for _, el := range fk.Elements {
+			if int(el.ColumnOpx) >= len(colsByOpx) {
+				return nil, fmt.Errorf("foreign key %q references an out-of-range column", fk.Name)
+			}
+			f.Columns = append(f.Columns, colsByOpx[el.ColumnOpx])
+			f.ReferencedColumns = append(f.ReferencedColumns, el.ReferencedColumnName)
+		}
+		if len(f.Columns) > 0 {
+			t.ForeignKeys = append(t.ForeignKeys, f)
 		}
 	}
 	return t, nil

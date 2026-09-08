@@ -156,10 +156,10 @@ func decodeFieldRangesVersioned(page []byte, recOff uint32, t *Table, rowVersion
 // value (from the SDI, not the record) as a SQL literal, for a field whose
 // fieldRange came back Default. It reuses decodeField's full type-decode
 // logic by treating the default bytes as if they were a normal inline field.
-func decodeInstantDefault(col *Column) (string, error) {
+func decodeInstantDefault(col *Column, format outputFormat) (string, error) {
 	if col.InstantDefaultIsNull || col.InstantDefault == nil {
-		return "NULL", nil
+		return nullLiteral(format), nil
 	}
 	fr := fieldRange{Start: 0, End: uint32(len(col.InstantDefault))}
-	return decodeField(nil, col, col.InstantDefault, fr)
+	return decodeField(nil, col, col.InstantDefault, fr, format)
 }

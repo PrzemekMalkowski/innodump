@@ -1,4 +1,4 @@
-// ibd-extractor - offline schema+data extraction from a MySQL 8.0/8.4 InnoDB
+// innodump - offline schema+data extraction from a MySQL 8.0/8.4 InnoDB
 // .ibd file (one table per file, ROW_FORMAT=DYNAMIC/COMPACT/REDUNDANT,
 // uncompressed or COMPRESSED - see zipdecompress.go).
 //

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -59,6 +60,12 @@ type prog struct {
 	stop  chan struct{}
 	done  chan struct{}
 	on    bool
+
+	// mu guards every write to stderr this prog makes (draw, finish, and
+	// Warnf, called from the caller's own goroutine while the bar is still
+	// live) - without it, a warning printed mid-walk can land mid-redraw,
+	// splicing the two together on one garbled line.
+	mu sync.Mutex
 }
 
 // newProg starts a progress indicator. total is the expected final value
@@ -98,8 +105,28 @@ func (p *prog) finish() {
 	}
 	p.on = false
 	close(p.stop)
-	<-p.done
+	<-p.done // run's goroutine has made its last draw call by now
+	p.mu.Lock()
 	fmt.Fprint(os.Stderr, "\r\033[2K")
+	p.mu.Unlock()
+}
+
+// Warnf prints a warning line to stderr, clearing this bar's own
+// in-progress line first if it's live so the two never end up spliced
+// together (see mu's comment) - the bar redraws itself fresh on its next
+// tick regardless, so nothing further is needed to restore it. Safe to
+// call on a prog that was never activated (not a TTY, or --no-progress,
+// or already finished): it just prints plainly, same as before this
+// existed.
+func (p *prog) Warnf(format string, args ...any) {
+	if !p.on {
+		fmt.Fprintf(os.Stderr, format, args...)
+		return
+	}
+	p.mu.Lock()
+	fmt.Fprint(os.Stderr, "\r\033[2K")
+	fmt.Fprintf(os.Stderr, format, args...)
+	p.mu.Unlock()
 }
 
 func (p *prog) run() {
@@ -124,6 +151,8 @@ func (p *prog) run() {
 func (p *prog) draw(spin string) {
 	elapsed := fmt.Sprintf("%4.1fs", time.Since(p.start).Seconds())
 	rows := p.extra.Load()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.total <= 0 {
 		fmt.Fprintf(os.Stderr, "\r\033[2K%s %s  %d row(s)  %s", spin, p.label, rows, elapsed)
 		return

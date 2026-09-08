@@ -1,0 +1,11 @@
+# Build output
+/innodump
+/dist/
+
+# Default output directories this tool itself creates when run from the
+# repo root (sqldump_*, tsvdump_*, and the pre-timestamp-suffix names from
+# early development)
+/sqldump/
+/sqldump_*/
+/tsvdump/
+/tsvdump_*/

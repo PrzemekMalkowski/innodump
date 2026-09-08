@@ -547,7 +547,15 @@ func legacyRowFormat(sp *Space, rootPage []byte) uint32 {
 // parseFRM reads path (a MySQL 5.6/5.7 .frm file) and sp's guessed root
 // page, and returns the same *ddTableJSON shape LoadSDITables would, so it
 // flows into BuildTable completely unchanged - see the file comment.
-func parseFRM(path string, sp *Space) (*ddTableJSON, error) {
+// parseFRM parses path (a table's .frm file) into the ddTableJSON shape
+// BuildTable expects. loc is nil for an ordinary file-per-table .ibd,
+// where sp IS that table's own tablespace and its clustered index root
+// page is found via the well-known "root page 3" convention
+// (guessLegacyRootPage); non-nil when the table's data instead lives in a
+// shared/system tablespace (sysdict.go's FindTableLocation), giving the
+// actual root page/index id its own SYS_INDEXES row recorded - the "page
+// 3" convention only ever held for a table's own dedicated file.
+func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -674,9 +682,16 @@ func parseFRM(path string, sp *Space) (*ddTableJSON, error) {
 		clust.Name = "GEN_CLUST_INDEX"
 	}
 
-	rootPage, indexID, err := guessLegacyRootPage(sp)
-	if err != nil {
-		return nil, err
+	var rootPage uint32
+	var indexID uint64
+	if loc != nil {
+		rootPage, indexID = loc.RootPage, loc.IndexID
+	} else {
+		var err error
+		rootPage, indexID, err = guessLegacyRootPage(sp)
+		if err != nil {
+			return nil, err
+		}
 	}
 	clust.SePrivateData = fmt.Sprintf("root=%d;id=%d;", rootPage, indexID)
 	rawTable.Indexes = append(rawTable.Indexes, clust)

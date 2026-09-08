@@ -1,11 +1,12 @@
-# 🗄️ ibd-extractor
+# 🗄️ innodump
 
-`ibd-extractor` is an offline reader for a single MySQL InnoDB tablespace
-file (`table.ibd`, file-per-table mode, or a shared/common tablespace
-holding several tables — see `--table` below) — MySQL 8.0/8.4, MySQL
-5.6/5.7 or MariaDB given the table's `.frm` file alongside it (see "MySQL
-5.6/5.7 (.frm) support" and "MariaDB support", below). Given `table.ibd`,
-it produces, under `./sqldump/` by default:
+`innodump` is an offline reader for MySQL/MariaDB InnoDB tablespace files
+(`table.ibd`, file-per-table mode, or a shared/common tablespace holding
+several tables — see `--table` below) — MySQL 26.x, 9.7, 8.0/8.4, MySQL
+5.6/5.7, or MariaDB given the table's `.frm` file alongside it (see "MySQL
+5.6/5.7 (.frm) support" and "MariaDB support", below). Given a table's
+tablespace file or a data directory, it produces, under
+`./sqldump_<timestamp>/` by default:
 
 - `schema.table-schema.sql` — a best-effort `CREATE TABLE` statement,
   reconstructed from the table's own embedded dictionary information (SDI),
@@ -20,16 +21,40 @@ shared/common tablespace's single `.ibd` file can hold more than one
 table — extracting `mysql.ibd`'s `user` table produces `mysql.user-schema.sql`
 /`mysql.user-data.sql`, not `mysql-schema.sql`/`mysql-data.sql`.
 
+Pass `--format tsv` instead to produce a MySQL Shell `util.loadDump()`
+-compatible dump directory (schema/table DDL plus tab-separated data
+files and metadata JSON) rather than SQL `INSERT` statements — see "TSV
+output" below. Pass `--source-dir DIR` instead of `--file` to recursively
+scan a directory for every `.ibd` file it holds and extract every table
+each one contains, rather than a single table from a single file — see
+"Bulk extraction" below. Point `--file` at `ibdata1` itself (with
+`--table schema.table`) to extract a table that has no `.ibd` of its own
+at all - the shared/system tablespace every table lives in together when
+`innodb_file_per_table=0` - see "Shared/system tablespace", below.
+
 It reads the file directly and does not connect to a running server, so
 it's safe to point at a copy of a `.ibd` file from a node that is up or
 down (as long as the copy is consistent — e.g. taken while the server was
 stopped, or via `FLUSH TABLES ... FOR EXPORT`).
 
+> **This is not a backup tool.** `innodump` reads whatever bytes happen to
+> be in the file(s) it's pointed at — it has no notion of a transactionally
+> consistent snapshot, doesn't coordinate with the server (no
+> `FLUSH TABLES ... FOR EXPORT`, no binlog/GTID position, no locking), and
+> can't tell you whether what it read is a moment-in-time-consistent view
+> across tables or even within one table. Point it at a copy taken while
+> the server was stopped, or at a proper consistent snapshot/backup (e.g.
+> `FLUSH TABLES ... FOR EXPORT`, `mariabackup`/`xtrabackup`, a filesystem
+> snapshot) — never at a live, running instance's own datadir — and treat
+> its output as a best-effort reconstruction for inspection, recovery, or
+> migration, not as a substitute for real backup/replication tooling or as
+> a guarantee that it reflects the most recent committed data.
+
 ## How it works (brief)
 
 Since MySQL 8.0, every InnoDB tablespace carries a compressed JSON copy of
 its own table definition — the Serialized Dictionary Information (SDI) —
-in a small hidden index inside the file itself. `ibd-extractor` locates
+in a small hidden index inside the file itself. `innodump` locates
 that index, decompresses the JSON, and uses it to learn every column's
 type, nullability, and physical storage layout, plus which page starts the
 table's clustered (PRIMARY KEY) index.
@@ -42,32 +67,222 @@ MySQL 8.0's LOB page format to recover the full value.
 
 ## Build
 
-Requires Go 1.21+.
+Requires Go 1.21+. Pulls in one dependency,
+[klauspost/compress](https://github.com/klauspost/compress) (pure Go, used
+only for `--compression=zstd` — see "TSV output" below), fetched
+automatically on first build.
 
 ```sh
-go build -o ibd-extractor .
+go build -o innodump .
 ```
+
+Linux and macOS (amd64/arm64) only for now — the progress bar's TTY
+detection uses a POSIX `ioctl` (see `progress.go`) that has no Windows
+equivalent yet, so a Windows build isn't offered on the
+[releases page](https://github.com/PrzemekMalkowski/innodump/releases).
 
 ## Usage
 
 ```
-ibd-extractor --file /path/to/table.ibd [options]
+innodump --file /path/to/table.ibd [options]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--file PATH` | Path to the `.ibd` file (required). |
-| `--out-dir DIR` | Directory for the two output files (default: `./sqldump`, created if it doesn't exist). |
-| `--table NAME` | Which table to extract, if the file holds more than one - always required for a shared/common tablespace. |
+| `--file PATH` | Path to the `.ibd` file (required, unless `--source-dir` is given instead). |
+| `--source-dir DIR` | Recursively scan DIR for `.ibd` files and extract every table each one holds, instead of a single `--file`. Cannot be combined with `--file` or `--table` (see "Bulk extraction", below). Refuses to scan a DIR that isn't a single instance's datadir or a single database directory - see `--force-scan`. |
+| `--force-scan` | With `--source-dir`, scan DIR even if it doesn't look like a single instance's datadir or a single database directory (see "Bulk extraction", below). |
+| `--include-system-schemas` | With `--source-dir --format=tsv`, also dump the server's own housekeeping schemas (`mysql`, `sys`, `performance_schema`, `information_schema`, `ndbinfo`) - left out by default (see "Bulk extraction", below). |
+| `--out-dir DIR` | Directory for the output (default: `./sqldump_<timestamp>` for `--format=sql`, `./tsvdump_<timestamp>` for `--format=tsv` - `<timestamp>` is this run's own start time, `date +%Y-%m-%d_%H.%M`, so repeated runs never collide; created if it doesn't exist). |
+| `--format sql\|tsv` | `sql` (default): a `schema.table-{schema,data}.sql` pair per table. `tsv`: a MySQL Shell `util.loadDump()`-compatible dump directory (see "TSV output", below). |
+| `--compression none\|zstd` | `--format=tsv` only: compress each table's data file with zstd (default `none`) - see "TSV output" below. |
+| `--compression-level N` | zstd compression level, 1-22 (default `1`, matching `util.dumpSchemas()`'s own lightest/fastest setting); only used with `--compression=zstd`. |
+| `--table NAME` | Which table to extract, if the file holds more than one - always required for a shared/common tablespace. Not usable with `--source-dir`, which always extracts every table it finds. |
 | `--limit N` | Stop after N rows (0 = all). |
-| `--ddl-only` | Only write the schema file; skip walking the table's data entirely. |
-| `--yes` | Overwrite existing output files without prompting (also honored via `YES=1`). Without it, an existing output file triggers an interactive y/N prompt, or - with no terminal to prompt on - a refusal naming the file(s) in question. |
+| `--ddl-only` | Only write the schema file(s); skip walking any table's data entirely. |
+| `--yes` | Overwrite existing output without prompting (also honored via `YES=1`). Without it: for `--format=sql`, an existing output file triggers an interactive y/N prompt, or - with no terminal to prompt on - a refusal naming the file(s) in question; for `--format=tsv`, the same, but checked only against the dump directory's own root metadata file (`@.json`), not every individual file it may end up writing. |
 | `--skip-corrupted` | On a corrupted leaf page, note it and carry on from the next page instead of stopping. |
 | `--no-progress` | Never draw the progress bar on stderr (also honored via `NO_PROGRESS=1`). |
-| `--verbose` | Print extra file/table details: page size, FSP flags, the MySQL version and dictionary/SDI versions that wrote the file, and index/column counts. |
+| `--verbose` | Print extra file/table details: page size, FSP flags, the MySQL version and dictionary/SDI versions that wrote the file, and index/column counts. Single `--file` only. |
 | `--debug` | Print each record's decoded field byte-ranges as they're read. |
-| `--dump-page N` | Hex-dump one page and its record chain, then exit. |
+| `--dump-page N` | Hex-dump one page and its record chain, then exit. Requires `--file`. |
 | `--version` | Print version and exit. |
+
+Status output (not the generated SQL/TSV files themselves, which are never
+colored) uses a little colour when stdout is a real terminal - a bold
+banner line, dim field labels next to a differently-colored value
+(`--verbose`'s `Space ID:    8`, say), and green/yellow/red for
+success/skipped/error counts. `--help`'s per-flag listing is colored the
+same way (flag name vs. its description). Disable all of it with
+`NO_COLOR=1` (https://no-color.org) or by piping/redirecting output, which
+always gets the same plain text either way.
+
+## TSV output (MySQL Shell-compatible dumps)
+
+`--format tsv` produces a dump directory that MySQL Shell's own
+`util.loadDump()` can load directly, as if it had been produced by
+`util.dumpSchemas()`/`util.dumpTables()` — one `.ibd` file's worth of data
+becomes one self-contained dump directory (or, with `--source-dir`, many
+`.ibd` files' tables all land in the one dump directory together). This was
+reverse-engineered from MySQL Shell's own source
+(`modules/util/dump/{dumper,text_dump_writer}.cc`, `modules/util/common/
+dump/*`, and `modules/util/load/dump_reader.cc` for what a loader actually
+requires) and confirmed end-to-end (MySQL Shell 8.4.8, dump format version
+2.0.1): every scalar type this tool decodes, `NULL`s, and a `BLOB` large
+enough to need multi-byte base64 padding, dumped with `--format tsv` and
+loaded back with `util.loadDump()`, byte-for-byte matched the original
+table (`SELECT * FROM orig EXCEPT SELECT * FROM reloaded`, both directions,
+came back empty) — including a `ROW_FORMAT=REDUNDANT` table and a
+`GEOMETRY` column round-tripped through `ST_AsText()`.
+
+For one `table.ibd`, this produces (under `--out-dir`, `./tsvdump_<timestamp>`
+by default):
+
+- `@.json` / `@.done.json` — the dump directory's root metadata: which
+  schemas/tables it holds, and that it's complete (`util.loadDump()` waits
+  for more data if `@.done.json` is missing, since a dump directory can
+  also be loaded while still being written to — not something this tool
+  ever needs, so it always writes `@.done.json` immediately).
+- `<schema>.sql` / `<schema>.json` — a `CREATE DATABASE IF NOT EXISTS` and
+  which tables that schema holds.
+- `<schema>@<table>.sql` — that table's `CREATE TABLE` (identical to
+  `--format=sql`'s schema file, less its explanatory comments).
+- `<schema>@<table>.json` — column list, TSV dialect, and the other
+  per-table options `util.loadDump()`'s importer needs.
+- `<schema>@<table>.tsv` (or `<schema>@<table>.tsv.zst` — see
+  "Compression", below) — the table's data, one field per column separated
+  by a tab, one row per line, in MySQL Shell's own default TSV dialect
+  (`FIELDS TERMINATED BY '\t' ESCAPED BY '\\' LINES TERMINATED BY '\n'`, no
+  `FIELDS ENCLOSED BY` - the same dialect `LOAD DATA INFILE` itself
+  defaults to): `NULL` is `\N`; the escape character, tab, newline,
+  carriage return, ASCII NUL, backspace, and Ctrl+Z each become a two-byte
+  backslash sequence in a string/JSON/ENUM/SET value; `BLOB`/`BINARY`/
+  `VARBINARY`/`BIT`/`GEOMETRY`/`VECTOR` columns are base64-encoded (with a
+  matching `"decodeColumns": {"col": "FROM_BASE64"}` entry in that table's
+  `.json`), matching `util.dumpSchemas()`'s own default encoding for
+  those "CSV-unsafe" types.
+
+Schema/table names are percent-encoded into filenames exactly the way
+MySQL Shell's own dumper does it (every ASCII byte outside
+`[A-Za-z0-9._~-]` becomes `%XX`; a name is otherwise used as-is), so a
+schema or table name with unusual characters still produces a loadable
+dump.
+
+### Compression
+
+Pass `--compression zstd` to compress each table's data file (`--compression
+none`, the default, leaves it plain) - `util.dumpSchemas()`/`dumpTables()`
+themselves default to zstd, but a single-table extraction tool producing a
+surprise `.zst` file nobody asked for seemed like the wrong default here.
+The result is fully `util.loadDump()`-compatible either way: the data file
+is named `<schema>@<table>.tsv.zst`, and its own metadata JSON records
+`"extension": "tsv.zst"` and `"compression": "zstd"`, exactly like a real
+compressed dump.
+
+`--compression-level N` (1-22, default `1`) is the same real zstd
+compression level `util.dumpSchemas()`'s own `compressionLevel` option
+takes. This tool uses a pure-Go zstd encoder
+([klauspost/compress](https://github.com/klauspost/compress)) rather than
+linking the real `libzstd`, so the file it writes is a completely standard,
+valid zstd frame — any zstd decoder, including the one `util.loadDump()`
+itself uses, reads it identically to one `libzstd` produced — but
+`--compression-level`'s number only selects the nearest of this encoder's
+four internal speed/ratio presets, rather than that exact numbered level;
+this affects the resulting compression ratio/speed trade-off, never
+whether the file loads correctly.
+
+Deliberately not reproduced, since a loader doesn't require any of it (see
+`tsvdump.go`'s package comment for chapter and verse): the checksum/`.idx`
+sidecar files, partitions, views, triggers, and histograms (this tool
+doesn't extract any of those regardless of output format), and a
+schema-level `DEFAULT CHARACTER SET`/
+`COLLATE` in `<schema>.sql` (this tool has no access to
+`information_schema.SCHEMATA`, only to the `.ibd` file itself — every
+table's own `DEFAULT CHARSET`/`COLLATE`, which is what actually governs
+its stored data, still comes through in full on each table's own `CREATE
+TABLE`, exactly as it does for `--format=sql`).
+
+## Bulk extraction (`--source-dir`)
+
+`--source-dir DIR` recursively scans `DIR` for every `.ibd` file it can
+find (matching by extension only, so a MySQL/MariaDB `datadir` copied
+as-is works directly) and extracts every table each one holds — unlike a
+single `--file`, which extracts one table (or, for a shared/common
+tablespace holding several, errors out asking `--table` to pick one),
+`--source-dir` always extracts every table it finds, since asking
+interactively doesn't fit a recursive scan across possibly many files.
+It combines with either `--format`:
+
+If `DIR` also holds an `ibdata1` (a pre-8.0/MariaDB instance with
+`innodb_file_per_table=0`, or one mixing the two), `--source-dir` doesn't
+stop at file-per-table `.ibd` files: every `.frm` file it finds with no
+`.ibd` of its own is looked up in `ibdata1`'s own internal dictionary
+(the same `SYS_TABLES`/`SYS_INDEXES` lookup `--table schema.table` uses
+against a single shared tablespace file — see "Shared/system tablespace",
+below — done once for every such `.frm` found, rather than one lookup per
+table), and every one found there is extracted from `ibdata1` the same as
+any other table. A `.frm` with no InnoDB entry there at all (most
+commonly a MyISAM/CSV/Aria table, or a `VIEW` — both perfectly normal
+things to find `.frm` files for outside a table's own schema) is simply
+left out — not an error, and not warned about individually, since a real
+`mysql` schema alone typically holds well over a hundred of them; the
+summary reports how many were left out this way as a single line.
+
+```sh
+# One schema.table-{schema,data}.sql pair per table, all in --out-dir.
+innodump --source-dir /var/lib/mysql --out-dir sqldump
+
+# One MySQL Shell-loadable dump directory holding every table found.
+innodump --source-dir /var/lib/mysql --format tsv --out-dir dump
+```
+
+A `.ibd` file this tool can't extract (missing `.frm`, an unsupported
+`ROW_FORMAT`, a corrupted page with `--skip-corrupted` not given, …) is
+skipped with a warning printed to stderr rather than stopping the whole
+scan; the final summary line reports how many of the files found were
+processed successfully, and the tool exits non-zero if any weren't. Since
+many tables can land in one flat `--out-dir` (`--format=sql`) or one dump
+directory (`--format=tsv`), a schema+table name collision is possible if
+`DIR` holds copies of tables from more than one distinct MySQL instance
+that happen to share both a schema and a table name — not something a
+single real instance's own `datadir` can produce, since schema+table names
+are already unique there.
+
+### Guardrail: `DIR` must look like one instance or one database
+
+Before scanning anything, `--source-dir` checks that `DIR` itself is
+either a single instance's own datadir (it holds `ibdata1` directly) or a
+single database directory (it holds `.ibd`/other files directly and no
+subdirectories of its own — a real schema directory never nests another
+one inside itself). If it's neither — most often because `DIR` is a
+parent folder holding several instances' datadirs side by side (a sandbox
+root, say) or a pile of old backups — the scan is refused outright rather
+than silently extracting far more than intended:
+
+```
+Error: /data/sandboxes doesn't look like a single instance's datadir (no
+ibdata1 found directly inside it) or a single database directory (it holds
+subdirectories of its own, which a real one never does) - ...
+```
+
+Point `--source-dir` at the specific datadir or database directory you
+actually want, or - if scanning a directory shaped like that really is
+what you want - pass `--force-scan` to skip this check.
+
+### System schemas excluded by default (`--format=tsv`)
+
+`--source-dir --format=tsv` is the "dump this whole instance" case, so —
+matching MySQL Shell's own `util.dumpInstance()` default — it leaves out
+the server's own housekeeping schemas (`mysql`, `sys`,
+`performance_schema`, `information_schema`, `ndbinfo`) unless
+`--include-system-schemas` is given. The final summary reports how many
+tables were left out this way (`Skipped: N system-schema table(s)
+skipped ...`). This filtering only applies to that combination: a single
+`--file`/`--table` naming a table in one of those schemas explicitly is
+always dumped (it was asked for by name), and `--source-dir --format=sql`
+dumps everything it finds, same as before this option existed — `sql`'s
+one-file-pair-per-table output has no per-run metadata to omit an entry
+from, so there was no equivalent MySQL Shell behavior to match there.
 
 ## Scope (v1)
 
@@ -205,6 +420,116 @@ reported against this tool. Not yet validated: older MariaDB checksum
 formats, and MariaDB's own `page_compression` feature (see "Scope (v1)",
 above).
 
+## Shared/system tablespace (`innodb_file_per_table=0`)
+
+Before MySQL 5.6.6 defaulted it on (and still today, for any server or
+table with `innodb_file_per_table=0`, common on older MariaDB/MySQL
+5.1-5.7 installs), a table's data doesn't live in its own `table.ibd` at
+all - every such table's rows sit together inside the shared/system
+tablespace, `ibdata1`. Point `--file` at `ibdata1` itself and pass
+`--table schema.table` (or `schema/table`, InnoDB's own internal form,
+exactly as `INFORMATION_SCHEMA.INNODB_SYS_TABLES.NAME` shows it) to
+extract one:
+
+```sh
+innodump --file /var/lib/mysql/ibdata1 --table sbtest.sbtest1
+```
+
+Omit `--table` (or misspell it) and the error lists every table this
+tablespace's own dictionary actually holds, the same way a `.ibd` file
+whose SDI holds more than one table does (see `--table`'s own
+description).
+
+`--source-dir` never requires naming a table this way - pointed at a
+datadir that holds `ibdata1`, it looks up every `.frm` file it finds with
+no `.ibd` of its own against this same dictionary automatically, on top
+of every ordinary file-per-table `.ibd` it finds - see "Bulk extraction",
+above.
+
+This reads InnoDB's own classic internal data dictionary - `SYS_TABLES`
+and `SYS_INDEXES`, still visible today via
+`INFORMATION_SCHEMA.INNODB_SYS_TABLES`/`INNODB_SYS_INDEXES` on a running
+MariaDB server (MySQL 8.0 replaced this dictionary with the SDI this tool
+otherwise relies on, so this path only ever runs for a pre-8.0-style,
+SDI-less tablespace) - to find which tablespace and root page a table's
+clustered index actually lives at, since the "root page 3" convention a
+table's own dedicated file always follows doesn't hold inside a shared
+one. The table's own SQL-level schema (column names/types/nullability,
+secondary indexes) still comes from its `.frm` file exactly as for any
+other pre-8.0 table (see "MySQL 5.6/5.7 (.frm) support" and "MariaDB
+support", above) - expected at `<schema>/<table>.frm`, a sibling of
+`ibdata1` itself, precisely where the server itself always keeps it
+regardless of where that table's InnoDB data physically lives. See
+`sysdict.go` for exactly which fields of `SYS_TABLES`/`SYS_INDEXES` this
+reads and how, cross-checked against MariaDB 10.6's own
+`storage/innobase/include/dict0boot.h`/`dict0crea.cc`, and validated
+end-to-end (a fresh MariaDB 11.8.6 instance, `innodb_file_per_table=0`,
+reload-and-diff came back empty) - including a table with a secondary
+index, and detecting a table whose dictionary entry points at a
+*different* tablespace (its own separate file, most likely) rather than
+silently reading the wrong bytes.
+
+**A consistent copy matters here even more than for a single table's
+`.ibd`, and `FLUSH TABLES` does not provide it.** A file-per-table
+tablespace can be safely copied live via `FLUSH TABLES ... FOR EXPORT`;
+there's no equivalent for the shared tablespace itself, and (confirmed
+against a real server) plain `FLUSH TABLES` does nothing to help -
+copying `ibdata1` off a *running* server without stopping it first (or
+without a proper hot-backup tool that replays the redo log, e.g.
+`mariabackup`/`xtrabackup`) can capture a stale, partially checkpointed
+snapshot: a table created or altered even minutes earlier can be entirely
+missing from `SYS_TABLES` in the copy, or its data out of date, simply
+because InnoDB's own background page cleaner hadn't gotten around to
+writing those particular dictionary/data pages back to the file yet -
+nothing this tool does is wrong in that case, and the same table becomes
+visible immediately once that write-back happens.
+
+Two ways to get a consistent copy:
+
+- **Stop the server first** (a normal/clean shutdown always flushes every
+  dirty page before exiting) - simplest, but not always practical on a
+  server you need to keep running.
+- **Force a flush without stopping it.** Note the current
+  `innodb_max_dirty_pages_pct`/`_lwm`, then:
+  ```sql
+  SET GLOBAL innodb_max_dirty_pages_pct = 0;
+  SET GLOBAL innodb_max_dirty_pages_pct_lwm = 0;
+  -- wait for this to reach 0 (a couple of seconds on a small/idle instance):
+  SHOW GLOBAL STATUS LIKE 'Innodb_buffer_pool_pages_dirty';
+  -- then restore what you noted above - leaving both at 0 forces the
+  -- server to flush far more aggressively than normal from then on:
+  SET GLOBAL innodb_max_dirty_pages_pct = 90;      -- example
+  SET GLOBAL innodb_max_dirty_pages_pct_lwm = 10;  -- example
+  ```
+  Confirmed on a real MariaDB 11.8.6 instance: a table created moments
+  earlier was invisible to this tool (`Innodb_buffer_pool_pages_dirty >
+  0`, unmoved by `FLUSH TABLES`) until this forced it to 0, with no
+  restart needed.
+
+`innodump` itself never connects to a server to do any of this (it's
+strictly an offline file reader, by design) - if a table isn't where
+`SYS_TABLES` says it should be, the error suggests exactly this.
+
+Only the system tablespace itself (space id 0) is read this way - a table
+recorded in `SYS_TABLES` with a different `SPACE` lives in its own
+file-per-table `.ibd` (use `--file` on that file directly) or in a
+separate general tablespace file this tool has no way to reach from here
+(the dictionary itself only ever lives in the system tablespace); either
+case is detected and reported by name/id rather than silently
+mis-decoded.
+
+`--skip-corrupted` only ever applies once a table has actually been
+found: a corrupted `SYS_TABLES`/`SYS_INDEXES` page is always fatal (there
+being only one way to reach the specific row `--table` names, unlike an
+ordinary table's own leaf-page chain, corruption there can't be skipped
+past any more than a corrupted root page can - see "Corrupted pages",
+above). Confirmed harmless on a real, heavily damaged `ibdata1` (50% of
+its pages randomly corrupted): every failure mode above - a corrupted
+dictionary header, `SYS_TABLES`, `SYS_INDEXES`, or the target table's own
+data - produced one of these same clear errors (or, for the table's own
+data specifically, a normal `--skip-corrupted` partial recovery), never a
+crash or a hang.
+
 ## INSTANT ADD/DROP COLUMN
 
 A row's physical layout depends on which schema version it was written
@@ -226,10 +551,21 @@ TABLE` and every `INSERT`, exactly as `SELECT *` on the live table would be.
   nullability, `AUTO_INCREMENT`, comments, generated-column expressions,
   the `PRIMARY KEY`, secondary indexes (`KEY`/`UNIQUE KEY`/`FULLTEXT
   KEY`/`SPATIAL KEY`, including prefix lengths, `DESC` order, and
-  `INVISIBLE`), and the table's default charset/collation are reproduced
-  from the SDI. `DEFAULT` clauses and other table-level options are not —
-  add them by hand if you need an exact round-trip DDL, or restore
-  alongside the original `SHOW CREATE TABLE` output if you have it.
+  `INVISIBLE`), `FOREIGN KEY` constraints (`ON DELETE`/`ON UPDATE`
+  included, omitted only when they're the implicit `NO ACTION` default,
+  exactly like `SHOW CREATE TABLE` itself), and the table's — and, where a
+  column's own differs, that column's own — default charset/collation are
+  reproduced from the SDI, matching `SHOW CREATE TABLE`'s own rules for
+  when a column needs an explicit `CHARACTER SET`/`COLLATE` (including a
+  column whose collation was simply named explicitly at `CREATE`/`ALTER
+  TABLE` time even though it happens to equal the table's own default, and
+  the special-cased `utf8mb4_0900_ai_ci` default collation - see
+  `sqlout.go`'s `GenerateDDL`, `resolveCollation`, and
+  `collations.go`'s `primaryCollationIDs` for chapter and verse, sourced
+  directly from `mysql-server`'s own `sql_show.cc`). `DEFAULT` clauses and
+  other table-level options are not reproduced — add them by hand if you
+  need an exact round-trip DDL, or restore alongside the original `SHOW
+  CREATE TABLE` output if you have it.
 - **`AUTO_INCREMENT=N`** is *not* in the SDI at all — the server tracks
   that counter separately, outside any single tablespace file. It's
   approximated as the highest value seen in the auto-increment column
@@ -283,6 +619,62 @@ the cheaper "is this an unallocated, all-zero page" check runs for one —
 a genuinely corrupted compressed page will likely surface as a decode
 error instead of a clean "checksum mismatch" one.
 
+**Heavy corruption is handled the same way, just more of it.** Tested
+against a real MariaDB 11.8.6 `ibdata1` with 15% and 50% of its pages
+each randomly damaged (1-10 flipped bytes apiece, scattered across the
+whole file - the internal dictionary and both `mysql`'s own and user
+tables' data alike): every run still finished promptly with no crash or
+hang, recovering every row on every page that survived intact and
+reporting a clear reason for every one that didn't. A table whose *root*
+page itself is corrupted recovers nothing (there's no way to find its
+data at all without it - same as a `--file` given a `.frm` whose page 3
+isn't actually an index page), and a corrupted `SYS_TABLES`/`SYS_INDEXES`
+page (see "Shared/system tablespace", below) is always fatal regardless
+of `--skip-corrupted` for the same reason - both already-documented,
+`--skip-corrupted` only ever helps with an ordinary leaf page.
+
+## Truncated files
+
+A file that simply ends early - most commonly an interrupted copy, rather
+than corruption - is detected specifically as that, not reported as a
+generic read error: **without** `--skip-corrupted`, extraction stops with
+`page N is past the end of the file (it holds only M page(s)) - the file
+looks truncated (not fully copied), rather than corrupted`. **With**
+`--skip-corrupted`, it's treated as a corrupted page with that same
+reason (so it shows up in the usual warning/`-- skipped corrupted page
+...` places) and the walk ends there - there's no page header to recover
+a "next page" pointer from, so unlike an ordinary corrupted page in the
+middle of an otherwise-intact file, this always means "nothing further
+exists to read," never "skip this one and keep going." Either way, the
+final summary adds one more line making this specific reason hard to
+miss:
+
+```
+Data file:   sqldump_.../schema.table-data.sql (11078 row(s) written, 1 corrupted page(s) skipped - see warnings above)
+Note:        the source file looks truncated (not fully copied) - recovered every row up to where it ends; anything stored after that point is missing.
+```
+
+`--source-dir` reports the same per file in its own per-table summary
+line (`... [source file truncated]`) and once more in its final tally
+(`N source file(s) looked truncated ...`) if any were.
+
+## Performance
+
+Reading and validating each leaf page, and following its `FIL_PAGE_NEXT`
+pointer to the next one, happen strictly in order, exactly as if this ran
+on a single core - that's what gives `--skip-corrupted` a well-defined
+"resume from the next page" and makes every row (and, for a corrupted
+page, every `-- skipped corrupted page ...`/`-- skipped a row ...`
+comment) land in the output in exactly the same order it always has. What
+*is* parallel is the CPU-bound part sitting behind that walk - decoding
+each row's columns and rendering them as SQL or TSV - which runs across
+every available core (`GOMAXPROCS`, normally one per CPU) in batches of up
+to that many pages at a time, before results reach the output file in the
+original order. Output itself is buffered (rather than one `write(2)`
+syscall per row, as versions before 0.5.0 did), which matters at least as
+much on a multi-million-row table - see `btree.go`'s `WalkRows` and
+`decodeBatch` for the details.
+
 ## Progress
 
 When stderr is a real terminal, a spinner shows on it once an extraction
@@ -291,9 +683,14 @@ before it ever appears) — a percentage bar keyed off the tablespace's page
 count, a running row count, and elapsed time. It's a rough proxy only: not
 every page in the file belongs to the table being extracted, so the bar
 may not reach 100% on a small table sharing a big tablespace, and it never
-touches stdout or the output files either way. Pass `--no-progress` (or
-set `NO_PROGRESS=1`) to suppress it, e.g. when running under something
-that doesn't want carriage-return redraws in its log capture.
+touches stdout or the output files either way. A `--skip-corrupted`
+warning printed mid-run (a corrupted page, or a row that failed to
+decode) clears the bar's own line first, so it always lands cleanly on
+its own line rather than splicing into whatever the bar had last drawn -
+the bar itself then picks back up on the next redraw. Pass
+`--no-progress` (or set `NO_PROGRESS=1`) to suppress it entirely, e.g.
+when running under something that doesn't want carriage-return redraws
+in its log capture.
 
 ## Validation
 
@@ -349,6 +746,15 @@ against the public `mysql-server` source (`storage/innobase`) and against
 which was used throughout development to validate these layouts —
 particularly the SDI B+tree walk and the modern LOB page format. This
 project is not affiliated with Oracle or with the ibdNinja project.
+
+## Trademark notice
+
+`innodump` is an independent open-source project and is not affiliated
+with, endorsed by, or sponsored by Oracle Corporation. MySQL and InnoDB
+are registered trademarks of Oracle Corporation and/or its affiliates.
+MariaDB is a registered trademark of MariaDB Foundation. Use of these
+names here is solely to describe compatibility and does not imply any
+affiliation with or endorsement by their respective trademark owners.
 
 ## License
 

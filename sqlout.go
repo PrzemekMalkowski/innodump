@@ -27,24 +27,56 @@ func backquote(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
 
+// resolveCollation returns id's charset name and, where this tool can
+// resolve it exactly, its full collation name too (collationKnown false
+// for one of MariaDB's newer UCA-1400 collations - see uca1400Charset -
+// where only the charset can be recovered). ok is false only if id isn't
+// recognized at all.
+func resolveCollation(id uint64) (charset, collation string, collationKnown, ok bool) {
+	if cl, found := collationTable[id]; found {
+		return charsetOf(cl.name), cl.name, true, true
+	}
+	if c, found := uca1400Charset(id); found {
+		return c.name, "", false, true
+	}
+	return "", "", false, false
+}
+
+// columnHasCharset reports whether c's type carries a character set/
+// collation at all (CHAR/VARCHAR/TEXT-family/ENUM/SET) - every other
+// column type still has a "collation_id" in the SDI (every column gets
+// one, string or not), but it's a meaningless leftover that must never be
+// rendered as CHARACTER SET/COLLATE.
+func columnHasCharset(ddType uint32) bool {
+	switch ddType {
+	case ddVarchar, ddVarString, ddString, ddTinyBlob, ddMediumBlob, ddBlob, ddLongBlob, ddEnum, ddSet:
+		return true
+	default:
+		return false
+	}
+}
+
 // GenerateDDL renders a best-effort CREATE TABLE statement. It reproduces
 // column types (straight from the SDI's own column_type_utf8, so these are
-// exact) plus NULL-ability, AUTO_INCREMENT, comments, generated-column
-// expressions, the PRIMARY KEY, secondary indexes, and the table's default
-// charset/collation and AUTO_INCREMENT counter - but deliberately not
-// DEFAULT clauses or other table options, which need more of the SDI than
-// v1 parses (or, for AUTO_INCREMENT, aren't in the SDI at all - see
-// Table.AutoIncrementNext's comment in schema.go). See the tool's
-// README/--help for the full list.
+// exact) plus NULL-ability, a column's own CHARACTER SET/COLLATE where SHOW
+// CREATE TABLE itself would show one (see resolveCollation/
+// columnHasCharset), AUTO_INCREMENT, comments, generated-column
+// expressions, the PRIMARY KEY, secondary indexes, FOREIGN KEY constraints,
+// and the table's default charset/collation and AUTO_INCREMENT counter -
+// but deliberately not DEFAULT clauses or other table options, which need
+// more of the SDI than v1 parses (or, for AUTO_INCREMENT, aren't in the SDI
+// at all - see Table.AutoIncrementNext's comment in schema.go). See the
+// tool's README/--help for the full list.
 func GenerateDDL(t *Table) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "-- Reconstructed by ibd-extractor from the table's embedded SDI.\n")
+	fmt.Fprintf(&b, "-- Reconstructed by %s from the table's embedded SDI.\n", appName)
 	fmt.Fprintf(&b, "-- Best-effort DDL: column types, NULL-ability, AUTO_INCREMENT, comments,\n")
-	fmt.Fprintf(&b, "-- generated columns, the PRIMARY KEY, secondary indexes, and the default\n")
-	fmt.Fprintf(&b, "-- charset/collation are reproduced; DEFAULT clauses and other table\n")
-	fmt.Fprintf(&b, "-- options are not. AUTO_INCREMENT (if any) is the highest value seen in\n")
-	fmt.Fprintf(&b, "-- the data plus one, not the server's persisted counter (the SDI doesn't\n")
-	fmt.Fprintf(&b, "-- carry that) - it may be behind if rows were deleted from the high end.\n")
+	fmt.Fprintf(&b, "-- generated columns, the PRIMARY KEY, secondary indexes, FOREIGN KEY\n")
+	fmt.Fprintf(&b, "-- constraints, and the default charset/collation are reproduced; DEFAULT\n")
+	fmt.Fprintf(&b, "-- clauses and other table options are not. AUTO_INCREMENT (if any) is\n")
+	fmt.Fprintf(&b, "-- the highest value seen in the data plus one, not the server's persisted\n")
+	fmt.Fprintf(&b, "-- counter (the SDI doesn't carry that) - it may be behind if rows were\n")
+	fmt.Fprintf(&b, "-- deleted from the high end.\n")
 	fmt.Fprintf(&b, "CREATE TABLE %s.%s (\n", backquote(t.SchemaRef), backquote(t.Name))
 
 	var lines []string
@@ -54,6 +86,34 @@ func GenerateDDL(t *Table) string {
 		}
 		var l strings.Builder
 		fmt.Fprintf(&l, "  %s %s", backquote(c.Name), c.TypeText)
+		// Matches SHOW CREATE TABLE's own rule (print_create_fields_stmt in
+		// sql_show.cc): CHARACTER SET shows whenever the column's charset
+		// differs from the table's own default, or the column's collation
+		// was named explicitly at CREATE/ALTER TABLE time (SDI's
+		// is_explicit_collation) - even if it happens to equal the table's
+		// own default. COLLATE shows whenever that collation isn't its
+		// charset's own "primary" one (primaryCollationIDs, collations.go),
+		// it was named explicitly, or it's the utf8mb4_0900_ai_ci special
+		// case (collationUtf8mb40900AiCi's own comment) - but only when the
+		// table's own default isn't ALSO utf8mb4_0900_ai_ci (an ordinary
+		// column in an ordinary modern utf8mb4 table, the common case,
+		// stays unannotated). A binary-charset column (BLOB/BINARY/
+		// VARBINARY) never gets either: its type keyword alone already
+		// implies that unambiguously, exactly as real DDL does.
+		if columnHasCharset(c.DDType) && !c.IsBinary() {
+			if charset, collation, collationKnown, ok := resolveCollation(c.CollationID); ok {
+				tblCharset, _, _, tblOK := resolveCollation(t.CollationID)
+				explicit := c.IsExplicitCollation
+				if explicit || !tblOK || charset != tblCharset {
+					fmt.Fprintf(&l, " CHARACTER SET %s", charset)
+				}
+				showCollate := explicit || !primaryCollationIDs[c.CollationID] ||
+					(c.CollationID == collationUtf8mb40900AiCi && t.CollationID != collationUtf8mb40900AiCi)
+				if collationKnown && showCollate {
+					fmt.Fprintf(&l, " COLLATE %s", collation)
+				}
+			}
+		}
 		if c.GenExpr != "" {
 			kind := "VIRTUAL"
 			if !c.IsVirtual {
@@ -91,6 +151,32 @@ func GenerateDDL(t *Table) string {
 		}
 		lines = append(lines, line)
 	}
+	for _, fk := range t.ForeignKeys {
+		refTable := backquote(fk.ReferencedTable)
+		if !strings.EqualFold(fk.ReferencedSchema, t.SchemaRef) {
+			refTable = backquote(fk.ReferencedSchema) + "." + refTable
+		}
+		fkCols := make([]string, len(fk.Columns))
+		for i, c := range fk.Columns {
+			fkCols[i] = backquote(c.Name)
+		}
+		refCols := make([]string, len(fk.ReferencedColumns))
+		for i, name := range fk.ReferencedColumns {
+			refCols[i] = backquote(name)
+		}
+		line := fmt.Sprintf("  CONSTRAINT %s FOREIGN KEY (%s) REFERENCES %s (%s)",
+			backquote(fk.Name), strings.Join(fkCols, ","), refTable, strings.Join(refCols, ","))
+		// SHOW CREATE TABLE only ever prints these when they're not the
+		// implicit NO ACTION default (print_foreign_key_info in
+		// sql_show.cc) - OnDelete/OnUpdate are already "" in that case.
+		if fk.OnDelete != "" {
+			line += " ON DELETE " + fk.OnDelete
+		}
+		if fk.OnUpdate != "" {
+			line += " ON UPDATE " + fk.OnUpdate
+		}
+		lines = append(lines, line)
+	}
 	b.WriteString(strings.Join(lines, ",\n"))
 	b.WriteString("\n) ENGINE=InnoDB")
 	if t.RowFormat == rowFormatCompact { // DYNAMIC is the server default; omit it
@@ -99,14 +185,23 @@ func GenerateDDL(t *Table) string {
 	if t.AutoIncrementNext != nil {
 		fmt.Fprintf(&b, " AUTO_INCREMENT=%d", *t.AutoIncrementNext)
 	}
-	if cl, ok := collationTable[t.CollationID]; ok {
-		fmt.Fprintf(&b, " DEFAULT CHARSET=%s COLLATE=%s", charsetOf(cl.name), cl.name)
-	} else if c, ok := uca1400Charset(t.CollationID); ok {
-		// One of MariaDB's newer UCA-1400 collations (id 2048+) - there's
-		// no way to recover which of its many language-variant/pad-mode
-		// names this specific id is (see uca1400Charset), so this can
-		// only state the charset, not COLLATE=<the real collation>.
-		fmt.Fprintf(&b, " DEFAULT CHARSET=%s", c.name)
+	if charset, collation, collationKnown, ok := resolveCollation(t.CollationID); ok {
+		fmt.Fprintf(&b, " DEFAULT CHARSET=%s", charset)
+		// Matches SHOW CREATE TABLE's own rule (show_create_table in
+		// sql_show.cc): COLLATE shows when the table's collation isn't its
+		// charset's own "primary" one (primaryCollationIDs, collations.go),
+		// or - unconditionally, even though it IS primary - it's the
+		// utf8mb4_0900_ai_ci special case (collationUtf8mb40900AiCi's own
+		// comment; unlike the column-level rule, the table-level one always
+		// applies, with no "unless the table already defaults to it" carve-out).
+		if collationKnown && (!primaryCollationIDs[t.CollationID] || t.CollationID == collationUtf8mb40900AiCi) {
+			fmt.Fprintf(&b, " COLLATE=%s", collation)
+		}
+		// Else (collationKnown false) one of MariaDB's newer UCA-1400
+		// collations (id 2048+) - there's no way to recover which of its
+		// many language-variant/pad-mode names this specific id is (see
+		// uca1400Charset), so this
+		// can only state the charset, not COLLATE=<the real collation>.
 	}
 	b.WriteString(";\n")
 	return b.String()
