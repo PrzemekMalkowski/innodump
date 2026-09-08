@@ -132,3 +132,45 @@ func walkRecords(page []byte, pageSize uint32, fn func(recOff uint32) bool) {
 		off = recNextOffset(page, off, pageSize)
 	}
 }
+
+// walkFreeRecords calls fn for every record on a single page's own free
+// list (PAGE_FREE) - InnoDB's singly-linked list of record slots freed by
+// purge (an already-committed DELETE whose row has since been physically
+// removed from the live record chain, as opposed to a delete-marked record
+// still on it - see recDeleted/walkRecords) but not yet reused for a new
+// row. A freed slot's own "next free" pointer lives in exactly the header
+// field a live record's next-record pointer does (rec.go's package
+// comment), so this is structurally identical to walkRecords, just started
+// from PAGE_FREE instead of infimum; the rest of the freed record's bytes
+// - including every field decodeOneRow reads - are untouched by purge, so
+// it decodes with the same fidelity as a live record, for as long as the
+// slot hasn't been carved up for a subsequent insert or lost to page
+// reorganization.
+//
+// The iteration cap (this page's own PAGE_N_HEAP - an upper bound on how
+// many record slots this page has ever handed out, live or free, so it can
+// never legitimately be exceeded) guards against an infinite loop if the
+// free list were somehow cyclic; it does not affect any genuine free list,
+// which is always shorter than that.
+func walkFreeRecords(page []byte, pageSize uint32, fn func(recOff uint32) bool) {
+	maxIter := int(pageGetNHeap(page))
+	if !pageIsCompact(page) {
+		off := uint32(pageGetFree(page))
+		for off != 0 && maxIter > 0 {
+			if !fn(off) {
+				return
+			}
+			off = recOldNextOffset(page, off)
+			maxIter--
+		}
+		return
+	}
+	off := uint32(pageGetFree(page))
+	for off != 0 && maxIter > 0 {
+		if !fn(off) {
+			return
+		}
+		off = recNextOffset(page, off, pageSize)
+		maxIter--
+	}
+}

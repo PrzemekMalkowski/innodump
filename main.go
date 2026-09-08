@@ -61,7 +61,7 @@ const appName = "innodump"
 // The hardcoded fallback below is what a plain "go build"/"go install"
 // (no ldflags) prints instead - kept in sync with the latest tagged
 // release by hand.
-var version = "0.7.6"
+var version = "0.7.7"
 
 var (
 	filePath             = flag.String("file", "", "Path to the .ibd file to extract")
@@ -75,6 +75,7 @@ var (
 	tableName            = flag.String("table", "", `Table name to extract, if the SDI holds more than one, or (required) "schema.table"/"schema/table" when --file is the shared/system tablespace itself (see the README) - not usable with --source-dir, which always extracts every table it finds`)
 	limitRows            = flag.Int("limit", 0, "Stop after this many rows (0 = all)")
 	ddlOnly              = flag.Bool("ddl-only", false, "Only write the schema file(s); skip walking any table's data entirely")
+	deletedOnly          = flag.Bool("deleted-only", false, "Dump only deleted rows instead of live ones - both still delete-marked (not yet purged) and already purged but not yet overwritten (still on the page's own free list) - for forensic recovery of recently deleted data. The output data file name gets a \"-deleted\" suffix, so it never collides with a normal dump of the same table")
 	skipCorrupted        = flag.Bool("skip-corrupted", false, "On a corrupted leaf page, note it and try to carry on from the next page instead of stopping")
 	noProgress           = flag.Bool("no-progress", false, "Never draw the progress bar on stderr (also honored: NO_PROGRESS=1)")
 	verbose              = flag.Bool("verbose", false, "Print extra .ibd/table details: page size, FSP flags, the MySQL version and dictionary/SDI versions that wrote the file, index/column counts")
@@ -281,7 +282,7 @@ func runSingleFile() error {
 		if err != nil {
 			return err
 		}
-		nOK, nErr, nCorruptPages, truncated, err := d.AddTable(sp, t, outCols, *ddlOnly, *limitRows, *skipCorrupted,
+		nOK, nErr, nCorruptPages, truncated, err := d.AddTable(sp, t, outCols, *ddlOnly, *limitRows, *skipCorrupted, *deletedOnly,
 			fmt.Sprintf("decoding %s.%s", t.SchemaRef, t.Name), mysqlVersionID, ck, *compressLevel)
 		if err != nil {
 			return err
@@ -297,7 +298,7 @@ func runSingleFile() error {
 		if *ddlOnly {
 			return nil
 		}
-		printRowSummary(nOK, nErr, nCorruptPages)
+		printRowSummary(nOK, nErr, nCorruptPages, *deletedOnly)
 		if truncated {
 			printTruncatedNote()
 		}
@@ -314,7 +315,7 @@ func runSingleFile() error {
 		return fmt.Errorf("creating output directory %s: %w", dir, err)
 	}
 	schemaPath := filepath.Join(dir, base+"-schema.sql")
-	dataPath := filepath.Join(dir, base+"-data.sql")
+	dataPath := filepath.Join(dir, sqlDataFilename(base, *deletedOnly))
 
 	wantPaths := []string{schemaPath}
 	if !*ddlOnly {
@@ -325,7 +326,7 @@ func runSingleFile() error {
 	}
 
 	nOK, nErr, nCorruptPages, truncated, err := writeSQLTable(sp, *filePath, schemaPath, dataPath, t, outCols,
-		*ddlOnly, *limitRows, *skipCorrupted)
+		*ddlOnly, *limitRows, *skipCorrupted, *deletedOnly)
 	if err != nil {
 		return err
 	}
@@ -333,7 +334,11 @@ func runSingleFile() error {
 	if *ddlOnly {
 		return nil
 	}
-	fmt.Printf("%s %s (%s row(s) written", dim("Data file:  "), id(dataPath), good(fmt.Sprintf("%d", nOK)))
+	rowNoun := "row(s)"
+	if *deletedOnly {
+		rowNoun = "delete-marked row(s)"
+	}
+	fmt.Printf("%s %s (%s %s written", dim("Data file:  "), id(dataPath), good(fmt.Sprintf("%d", nOK)), rowNoun)
 	if nErr > 0 {
 		fmt.Printf(", %s row(s) skipped - see warnings above", warn(fmt.Sprintf("%d", nErr)))
 	}
@@ -356,7 +361,7 @@ func runSingleFile() error {
 // generic nCorruptPages count, since it means specifically that the file
 // wasn't fully copied, not that one page among many good ones was bad.
 func writeSQLTable(sp *Space, srcPath, schemaPath, dataPath string, t *Table, outCols []*Column,
-	ddlOnly bool, limitRows int, skipCorrupted bool) (nOK, nErr, nCorruptPages int, truncated bool, err error) {
+	ddlOnly bool, limitRows int, skipCorrupted, deletedOnly bool) (nOK, nErr, nCorruptPages int, truncated bool, err error) {
 	if !ddlOnly {
 		autoIncIdx := -1
 		for i, c := range outCols {
@@ -398,7 +403,7 @@ func writeSQLTable(sp *Space, srcPath, schemaPath, dataPath string, t *Table, ou
 			fmt.Fprintf(bw, "-- skipped corrupted page %d (table %s.%s, index %q, id %d): %s\n",
 				cp.PageNo, t.SchemaRef, t.Name, t.IndexName, t.IndexID, cp.Reason)
 		}
-		walkErr := WalkRows(sp, t, outCols, formatSQL, skipCorrupted, onCorrupt, func(roe RowOrError) bool {
+		onRow := func(roe RowOrError) bool {
 			pr.set(int64(roe.PageNo))
 			if roe.Err != nil {
 				nErr++
@@ -415,7 +420,15 @@ func writeSQLTable(sp *Space, srcPath, schemaPath, dataPath string, t *Table, ou
 			nOK++
 			pr.setExtra(int64(nOK))
 			return limitRows == 0 || nOK < limitRows
-		})
+		}
+		if deletedOnly {
+			// The same historical row content can genuinely turn up more
+			// than once (see dedupDeletedRows) - drop exact repeats so
+			// nOK, and the data file itself, only ever reflect distinct
+			// recovered rows.
+			onRow = dedupDeletedRows(onRow)
+		}
+		walkErr := WalkRows(sp, t, outCols, formatSQL, skipCorrupted, deletedOnly, onCorrupt, onRow)
 		pr.finish()
 		if ferr := bw.Flush(); ferr != nil && walkErr == nil {
 			walkErr = ferr
@@ -438,8 +451,12 @@ func writeSQLTable(sp *Space, srcPath, schemaPath, dataPath string, t *Table, ou
 	return nOK, nErr, nCorruptPages, truncated, nil
 }
 
-func printRowSummary(nOK, nErr, nCorruptPages int) {
-	fmt.Printf("%s %s written", dim("Rows:       "), good(fmt.Sprintf("%d", nOK)))
+func printRowSummary(nOK, nErr, nCorruptPages int, deletedOnly bool) {
+	label := "Rows:"
+	if deletedOnly {
+		label = "Deleted rows:"
+	}
+	fmt.Printf("%s %s written", dim(fmt.Sprintf("%-12s", label)), good(fmt.Sprintf("%d", nOK)))
 	if nErr > 0 {
 		fmt.Printf(", %s skipped - see warnings above", warn(fmt.Sprintf("%d", nErr)))
 	}
@@ -620,7 +637,7 @@ func runSourceDir() error {
 			dim("Note:       "), nNotFoundTotal)
 	}
 	if !*ddlOnly {
-		printRowSummary(nRowsTotal, nRowErrTotal, nCorruptTotal)
+		printRowSummary(nRowsTotal, nRowErrTotal, nCorruptTotal, *deletedOnly)
 	}
 	fmt.Printf("%s %s\n", dim("Output:     "), id(dir))
 	if nTruncatedTotal > 0 {
@@ -746,11 +763,11 @@ func processTable(sp *Space, srcLabel, dir string, target *ddTableJSON, mysqlVer
 	var err error
 	if tsvDump != nil {
 		ck, _ := parseCompressionKind(*compression) // already validated in run()
-		tOK, tErr, tCorrupt, tTruncated, err = tsvDump.AddTable(sp, t, outCols, *ddlOnly, *limitRows, *skipCorrupted, label, mysqlVersionID, ck, *compressLevel)
+		tOK, tErr, tCorrupt, tTruncated, err = tsvDump.AddTable(sp, t, outCols, *ddlOnly, *limitRows, *skipCorrupted, *deletedOnly, label, mysqlVersionID, ck, *compressLevel)
 	} else {
 		base := outputBaseName(t.SchemaRef, t.Name)
 		schemaPath := filepath.Join(dir, base+"-schema.sql")
-		dataPath := filepath.Join(dir, base+"-data.sql")
+		dataPath := filepath.Join(dir, sqlDataFilename(base, *deletedOnly))
 		wantPaths := []string{schemaPath}
 		if !*ddlOnly {
 			wantPaths = append(wantPaths, dataPath)
@@ -760,7 +777,7 @@ func processTable(sp *Space, srcLabel, dir string, target *ddTableJSON, mysqlVer
 			return false, 0, 0, 0, false, false
 		}
 		tOK, tErr, tCorrupt, tTruncated, err = writeSQLTable(sp, srcLabel, schemaPath, dataPath, t, outCols,
-			*ddlOnly, *limitRows, *skipCorrupted)
+			*ddlOnly, *limitRows, *skipCorrupted, *deletedOnly)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s %s: table %q: %v\n", warn("warning:"), srcLabel, t.Name, err)
@@ -770,7 +787,11 @@ func processTable(sp *Space, srcLabel, dir string, target *ddTableJSON, mysqlVer
 	if *ddlOnly {
 		fmt.Printf("schema only\n")
 	} else {
-		fmt.Printf("%s row(s)", good(fmt.Sprintf("%d", tOK)))
+		rowNoun := "row(s)"
+		if *deletedOnly {
+			rowNoun = "delete-marked row(s)"
+		}
+		fmt.Printf("%s %s", good(fmt.Sprintf("%d", tOK)), rowNoun)
 		if tErr > 0 {
 			fmt.Printf(", %s skipped", warn(fmt.Sprintf("%d", tErr)))
 		}
@@ -994,6 +1015,17 @@ func outputBaseName(schemaRef, table string) string {
 		return safe(table)
 	}
 	return safe(schemaRef) + "." + safe(table)
+}
+
+// sqlDataFilename builds the "-data.sql" file's own basename from base (see
+// outputBaseName): plain "<base>-data.sql", or "<base>-data-deleted.sql"
+// with --deleted-only, so a deleted-rows dump never silently overwrites (or
+// gets overwritten by) a normal one written to the same output directory.
+func sqlDataFilename(base string, deletedOnly bool) string {
+	if deletedOnly {
+		return base + "-data-deleted.sql"
+	}
+	return base + "-data.sql"
 }
 
 // confirmOverwrite checks paths for ones that already exist and, unless yes

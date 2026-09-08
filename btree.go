@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -163,6 +164,39 @@ type CorruptPage struct {
 	Truncated bool // pageNo is past the end of the file itself - see collectBatch
 }
 
+// dedupDeletedRows wraps fn so that a row whose full set of output values
+// is byte-identical to one already seen this walk is silently dropped
+// (fn is simply never called for it, and the walk carries straight on)
+// instead of passed through a second time.
+//
+// This only ever matters under --deleted-only, and only because the same
+// historical row content can genuinely turn up at more than one (page,
+// offset) in the same file: a page split copies a record's bytes to the
+// new page verbatim, so if the ORIGINAL copy is later found on its old
+// page's free list (see walkFreeRecords) while the row's own later,
+// separately-deleted copy is independently recovered from wherever it
+// ended up living, both copies decode to the exact same field values.
+// Showing the same values twice adds no forensic information, so only the
+// first copy is kept; a row whose fields genuinely differ from every copy
+// seen so far - even one sharing the same primary key - is always kept,
+// since that's a distinct historical version of the row, not a duplicate.
+// A row that failed to decode (Err set, Row nil) always passes through
+// unfiltered, exactly like every other RowOrError consumer treats it.
+func dedupDeletedRows(fn func(RowOrError) bool) func(RowOrError) bool {
+	seen := make(map[string]bool)
+	return func(roe RowOrError) bool {
+		if roe.Err != nil || roe.Row == nil {
+			return fn(roe)
+		}
+		key := strings.Join(roe.Row.Values, "\x00")
+		if seen[key] {
+			return true // duplicate of an earlier row - skip, keep walking
+		}
+		seen[key] = true
+		return fn(roe)
+	}
+}
+
 // pageEvent is one leaf page's outcome, as collected by WalkRows' sequential
 // batch-building loop: either a corrupt-page report (see CorruptPage) or the
 // (possibly still being decoded, in parallel - see decodeBatch) rows found
@@ -174,7 +208,11 @@ type pageEvent struct {
 }
 
 // WalkRows decodes every live (non-delete-marked) row in the clustered
-// index and streams it to fn. fn returning false stops the walk early.
+// index and streams it to fn - or, with deletedOnly, every row that IS
+// still delete-marked instead (InnoDB doesn't overwrite a deleted record's
+// bytes until the space is reused, so a still-live delete-marked record on
+// a leaf page this walk reaches is recoverable exactly like a live one;
+// see recDeleted). fn returning false stops the walk early.
 //
 // Every leaf page is validated (checksum/LSN consistency, page type, index
 // id) before its records are read. By default a bad page is a fatal error
@@ -198,7 +236,7 @@ type pageEvent struct {
 // version used - so this is purely a speedup: every ordering guarantee,
 // and the exact set of rows/pages onCorrupt and fn are called for, is
 // unchanged.
-func WalkRows(sp *Space, t *Table, outCols []*Column, format outputFormat, skipCorrupted bool, onCorrupt func(CorruptPage), fn func(RowOrError) bool) error {
+func WalkRows(sp *Space, t *Table, outCols []*Column, format outputFormat, skipCorrupted, deletedOnly bool, onCorrupt func(CorruptPage), fn func(RowOrError) bool) error {
 	leaf, err := leftmostLeaf(sp, t)
 	if err != nil {
 		var te *errTruncated
@@ -210,7 +248,9 @@ func WalkRows(sp *Space, t *Table, outCols []*Column, format outputFormat, skipC
 			// but --skip-corrupted's job is still "recover what's
 			// possible": fall back to reading every page the file DOES
 			// have and picking out whichever ones happen to be leaf pages
-			// of this index - see scanTruncatedLeaves.
+			// of this index - see scanUnlinkedLeaves. Nothing has been
+			// read yet (leftmostLeaf failed before collectBatch ever ran),
+			// so there's no visited set to pass.
 			if onCorrupt != nil {
 				onCorrupt(CorruptPage{
 					PageNo: t.RootPage,
@@ -219,7 +259,7 @@ func WalkRows(sp *Space, t *Table, outCols []*Column, format outputFormat, skipC
 					Truncated: true,
 				})
 			}
-			return scanTruncatedLeaves(sp, t, outCols, format, fn)
+			return scanUnlinkedLeaves(sp, t, outCols, format, deletedOnly, nil, fn)
 		}
 		return fmt.Errorf("finding the leftmost leaf page: %w", err)
 	}
@@ -229,9 +269,19 @@ func WalkRows(sp *Space, t *Table, outCols []*Column, format outputFormat, skipC
 		workers = 1
 	}
 
+	// visited records every page number the ordinary walk below actually
+	// reads, so that --deleted-only's own supplementary scan (below) never
+	// re-reads (and so never double-reports) a page the ordinary walk
+	// already covered. Left nil - collectBatch skips populating it, at
+	// zero cost - unless deletedOnly needs it.
+	var visited map[uint32]bool
+	if deletedOnly {
+		visited = make(map[uint32]bool, sp.NumPages)
+	}
+
 	pageNo := leaf
 	for pageNo != filNull {
-		batch, fatalErr := collectBatch(sp, t, shape, skipCorrupted, workers, &pageNo)
+		batch, fatalErr := collectBatch(sp, t, shape, skipCorrupted, deletedOnly, visited, workers, &pageNo)
 		decodeBatch(sp, t, outCols, format, batch)
 
 		for _, ev := range batch {
@@ -251,7 +301,57 @@ func WalkRows(sp *Space, t *Table, outCols []*Column, format outputFormat, skipC
 			return fatalErr
 		}
 	}
+
+	if deletedOnly {
+		// A leaf page purge has fully emptied can be merged into a sibling
+		// and deallocated - unlinked from the live leaf chain the loop
+		// above just followed - without its bytes being erased or its
+		// header reformatted until the freed page is claimed for
+		// something else. Such a page is invisible to the ordinary walk
+		// (nothing live points to it any more), but may still hold exactly
+		// the delete-marked/free-list leftovers --deleted-only is after,
+		// so it needs its own pass - see scanUnlinkedLeaves.
+		return scanUnlinkedLeaves(sp, t, outCols, format, deletedOnly, visited, fn)
+	}
 	return nil
+}
+
+// collectRowOffsets returns, for one already-validated, decompressed leaf
+// page, every record offset decodeBatch should decode: by default, every
+// live record NOT carrying the delete-mark bit (an ordinary row); with
+// deletedOnly, instead every live record that DOES carry it (deleted, but
+// not yet purged - see recDeleted/walkRecords) PLUS every record still
+// sitting on the page's own free list (deleted AND already purged, but not
+// yet overwritten by a later insert - see walkFreeRecords). The two
+// deletedOnly sources can never overlap: a free-list record was, by
+// definition, already unlinked from the live record chain walkRecords
+// traverses.
+func collectRowOffsets(page []byte, pageSize uint32, deletedOnly bool) []uint32 {
+	var offs []uint32
+	walkRecords(page, pageSize, func(recOff uint32) bool {
+		if recDeleted(page, recOff) == deletedOnly {
+			offs = append(offs, recOff)
+		}
+		return true
+	})
+	if deletedOnly {
+		walkFreeRecords(page, pageSize, func(recOff uint32) bool {
+			offs = append(offs, recOff)
+			return true
+		})
+	}
+	return offs
+}
+
+// rowOrErrorsFor turns a page's own record-offset list (collectRowOffsets)
+// into the []RowOrError shape pageEvent/decodeBatch expect, all still
+// carrying pageNo and their own recOff with Row/Err left blank.
+func rowOrErrorsFor(pageNo uint32, offs []uint32) []RowOrError {
+	rows := make([]RowOrError, len(offs))
+	for i, recOff := range offs {
+		rows[i] = RowOrError{PageNo: pageNo, RecOff: recOff}
+	}
+	return rows
 }
 
 // collectBatch reads and validates up to maxPages leaf pages starting at
@@ -265,10 +365,13 @@ func WalkRows(sp *Space, t *Table, outCols []*Column, format outputFormat, skipC
 // hasn't read yet. A non-nil returned error is always the *last* thing
 // that happened (a fatal corrupt page) - every event before it in the
 // returned slice is still good and must still reach onCorrupt/fn.
-func collectBatch(sp *Space, t *Table, shape zipIndexShape, skipCorrupted bool, maxPages int, pageNo *uint32) ([]pageEvent, error) {
+func collectBatch(sp *Space, t *Table, shape zipIndexShape, skipCorrupted, deletedOnly bool, visited map[uint32]bool, maxPages int, pageNo *uint32) ([]pageEvent, error) {
 	batch := make([]pageEvent, 0, maxPages)
 	for len(batch) < maxPages && *pageNo != filNull {
 		pn := *pageNo
+		if visited != nil {
+			visited[pn] = true
+		}
 		if reason := truncatedReason(sp, pn); reason != "" {
 			// The file itself doesn't hold this page at all - not a bad
 			// checksum or a wrong page type on a page that IS there, but
@@ -322,41 +425,50 @@ func collectBatch(sp *Space, t *Table, shape zipIndexShape, skipCorrupted bool, 
 			continue
 		}
 
-		var offs []uint32
-		walkRecords(page, sp.PageSize, func(recOff uint32) bool {
-			if !recDeleted(page, recOff) {
-				offs = append(offs, recOff)
-			}
-			return true
-		})
-		ev := pageEvent{page: page, rows: make([]RowOrError, len(offs))}
-		for i, recOff := range offs {
-			ev.rows[i] = RowOrError{PageNo: pn, RecOff: recOff}
-		}
+		ev := pageEvent{page: page, rows: rowOrErrorsFor(pn, collectRowOffsets(page, sp.PageSize, deletedOnly))}
 		batch = append(batch, ev)
 		*pageNo = filNextPage(page)
 	}
 	return batch, nil
 }
 
-// scanTruncatedLeaves is WalkRows' last-resort fallback for a tablespace
-// so badly truncated that even navigating from the root to the correct
-// leftmost leaf isn't possible (see leftmostLeaf/errTruncated): normal
-// key order depends on that navigation, so instead this reads every page
-// the file actually has, page 0 through sp.NumPages-1, and decodes any
-// leaf page it finds belonging to this index (matching FIL_PAGE_TYPE,
-// index id, and level 0 - the same checks collectBatch applies to a page
-// it already knows is part of this index's leaf chain), in physical
-// page-number order rather than key order. Every other page - non-leaf
-// pages of this index, pages belonging to a different index or table
-// sharing this tablespace, FSP/INODE/undo bookkeeping pages, a page that
-// fails its own checksum - is silently skipped: this is a best-effort
-// scan of what a badly truncated file happens to still hold, not a
-// validated walk, so there's no single well-defined "corrupt page" to
-// report for any of them the way there is during the normal walk.
-func scanTruncatedLeaves(sp *Space, t *Table, outCols []*Column, format outputFormat, fn func(RowOrError) bool) error {
+// scanUnlinkedLeaves reads every page the file actually has, page 0 through
+// sp.NumPages-1, and decodes any leaf page it finds belonging to this index
+// (matching FIL_PAGE_TYPE, index id, and level 0 - the same checks
+// collectBatch applies to a page it already knows is part of this index's
+// leaf chain) that isn't in visited, in physical page-number order rather
+// than key order. It serves two different callers, for two different
+// reasons a page can be unreachable from the live leaf chain the ordinary
+// walk follows:
+//
+//   - WalkRows' --skip-corrupted fallback, when the file is so badly
+//     truncated that even navigating from the root to the correct
+//     leftmost leaf isn't possible (see leftmostLeaf/errTruncated): normal
+//     key order depends on that navigation, so this is the only way to
+//     recover anything at all. visited is nil here (nothing has been read
+//     yet at that point).
+//   - --deleted-only's own supplement to an otherwise-ordinary walk (see
+//     WalkRows): a leaf page purge has fully emptied can be merged into a
+//     sibling and deallocated - unlinked from the live chain, though its
+//     bytes stay exactly as they were until the freed page is claimed for
+//     something else - which makes any delete-marked/free-list leftovers
+//     it still holds invisible to the ordinary walk. Here visited is the
+//     page numbers that walk already covered, so this never re-reads (and
+//     so never double-reports) any of them.
+//
+// Every other page - non-leaf pages of this index, pages belonging to a
+// different index or table sharing this tablespace, FSP/INODE/undo
+// bookkeeping pages, a page that fails its own checksum - is silently
+// skipped: this is a best-effort scan of whatever the file happens to
+// still hold, not a validated walk, so there's no single well-defined
+// "corrupt page" to report for any of them the way there is during the
+// ordinary walk.
+func scanUnlinkedLeaves(sp *Space, t *Table, outCols []*Column, format outputFormat, deletedOnly bool, visited map[uint32]bool, fn func(RowOrError) bool) error {
 	shape := tableZipShape(t)
 	for pn := uint32(0); pn < sp.NumPages; pn++ {
+		if visited[pn] {
+			continue
+		}
 		raw, err := sp.ReadPage(pn)
 		if err != nil {
 			continue
@@ -371,13 +483,7 @@ func scanTruncatedLeaves(sp *Space, t *Table, outCols []*Column, format outputFo
 		if err != nil {
 			continue
 		}
-		var offs []uint32
-		walkRecords(page, sp.PageSize, func(recOff uint32) bool {
-			if !recDeleted(page, recOff) {
-				offs = append(offs, recOff)
-			}
-			return true
-		})
+		offs := collectRowOffsets(page, sp.PageSize, deletedOnly)
 		if len(offs) == 0 {
 			continue
 		}

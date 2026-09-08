@@ -558,6 +558,16 @@ func pageIsCompact(page []byte) bool {
 func pageGetNHeap(page []byte) uint16 {
 	return binary.BigEndian.Uint16(page[pageNHeap:]) &^ 0x8000
 }
+
+// pageGetFree returns PAGE_FREE: the page offset (record origin, same
+// convention as pageNewInfimum) of the first record on this page's own
+// free list - InnoDB's singly-linked list of purged-but-not-yet-reused
+// record slots, threaded through exactly the same per-record "next
+// record" header field a live record's own next-pointer uses (see
+// walkFreeRecords) - or 0 if the free list is empty.
+func pageGetFree(page []byte) uint16 {
+	return binary.BigEndian.Uint16(page[pageFree:])
+}
 func pageGetLevel(page []byte) uint16 { return binary.BigEndian.Uint16(page[pageLevel:]) }
 func pageGetNRecs(page []byte) uint16 { return binary.BigEndian.Uint16(page[pageNRecs:]) }
 func pageGetIndexID(page []byte) uint64 {

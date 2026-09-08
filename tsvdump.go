@@ -289,12 +289,17 @@ func (d *TSVDump) ensureSchema(schema string) (*tsvSchemaState, error) {
 // Finish later writes out. progressLabel is passed straight to newProg
 // (progress.go). sourceVersionID is the table's own SDI mysqld_version_id
 // (0 if it has none - see noteSourceVersion). compression/compressionLevel
-// select the data file's on-disk compression - see compress.go. Returns
-// the same row/page/truncated-file counts WalkRows' caller in main.go
-// already tracks for the SQL path (see writeSQLTable's own comment on
-// truncated).
+// select the data file's on-disk compression - see compress.go. With
+// deletedOnly, every file this writes for the table (DDL, options JSON, and
+// data) gets a "-deleted" suffix on its basename - the schema/root metadata
+// still points at that basename (see schemaState.tableBasenames), so the
+// dump directory stays internally consistent and util.loadDump()-loadable,
+// while never colliding with a normal dump of the same table written to the
+// same directory. Returns the same row/page/truncated-file counts
+// WalkRows' caller in main.go already tracks for the SQL path (see
+// writeSQLTable's own comment on truncated).
 func (d *TSVDump) AddTable(sp *Space, t *Table, outCols []*Column, ddlOnly bool, limitRows int,
-	skipCorrupted bool, progressLabel string, sourceVersionID uint32,
+	skipCorrupted, deletedOnly bool, progressLabel string, sourceVersionID uint32,
 	compression compressionKind, compressionLevel int) (nOK, nErr, nCorruptPages int, truncated bool, err error) {
 	d.noteSourceVersion(sourceVersionID)
 	schemaState, err := d.ensureSchema(t.SchemaRef)
@@ -302,6 +307,9 @@ func (d *TSVDump) AddTable(sp *Space, t *Table, outCols []*Column, ddlOnly bool,
 		return 0, 0, 0, false, err
 	}
 	tableBasename := encodeTableBasename(t.SchemaRef, t.Name)
+	if deletedOnly {
+		tableBasename += "-deleted"
+	}
 	schemaState.tables = append(schemaState.tables, t.Name)
 	schemaState.tableBasenames[t.Name] = tableBasename
 
@@ -345,7 +353,7 @@ func (d *TSVDump) AddTable(sp *Space, t *Table, outCols []*Column, ddlOnly bool,
 			// splice into it - see progress.go.
 			pr.Warnf("%s corrupted page %d (index %q, id %d): %s\n", warn("warning:"), cp.PageNo, t.IndexName, t.IndexID, cp.Reason)
 		}
-		walkErr := WalkRows(sp, t, outCols, formatTSV, skipCorrupted, onCorrupt, func(roe RowOrError) bool {
+		onRow := func(roe RowOrError) bool {
 			pr.set(int64(roe.PageNo))
 			if roe.Err != nil {
 				nErr++
@@ -363,7 +371,15 @@ func (d *TSVDump) AddTable(sp *Space, t *Table, outCols []*Column, ddlOnly bool,
 			nOK++
 			pr.setExtra(int64(nOK))
 			return limitRows == 0 || nOK < limitRows
-		})
+		}
+		if deletedOnly {
+			// The same historical row content can genuinely turn up more
+			// than once (see dedupDeletedRows) - drop exact repeats so
+			// nOK, and the data file itself, only ever reflect distinct
+			// recovered rows.
+			onRow = dedupDeletedRows(onRow)
+		}
+		walkErr := WalkRows(sp, t, outCols, formatTSV, skipCorrupted, deletedOnly, onCorrupt, onRow)
 		pr.finish()
 		if ferr := dw.Finish(); ferr != nil && walkErr == nil {
 			walkErr = ferr

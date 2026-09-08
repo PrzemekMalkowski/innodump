@@ -76,7 +76,6 @@ warning: corrupted page 100 (index "PRIMARY", id 943): LSN low bytes at the star
 Schema file: sqldump_2026-09-08_15.43/db1.instant_t-schema.sql
 Data file:   sqldump_2026-09-08_15.43/db1.instant_t-data.sql (100680 row(s) written, 1 corrupted page(s) skipped - see warnings above)
 ```
-
 ```
 $ innodump --file child_1.ibd --skip-corrupted
 === innodump 0.7.6 ===
@@ -87,7 +86,6 @@ Schema file: sqldump_2026-09-08_15.44/db1.child_1-schema.sql
 Data file:   sqldump_2026-09-08_15.44/db1.child_1-data.sql (3721 row(s) written, 1 corrupted page(s) skipped - see warnings above)
 Note:        the source file looks truncated (not fully copied) - recovered every row up to where it ends; anything stored after that point is missing.
 ```
-
 ```
 $ innodump --source-dir /data/ --format tsv
 === innodump 0.7.6 ===
@@ -103,6 +101,25 @@ Skipped:     4 system-schema table(s) skipped (mysql/sys/performance_schema/info
 Note:        129 .frm file(s) with no matching .ibd had no InnoDB entry in ibdata1's own dictionary either - likely a non-InnoDB table, a VIEW, or a general tablespace this tool can't reach - skipped
 Rows:        8 written
 Output:      tsvdump_2026-09-08_15.59
+```
+```
+$ innodump --file /data/sandboxes/msb_8_4_3/data/sbtest/sbtest1.ibd --deleted-only --verbose
+File:        /data/sandboxes/msb_8_4_3/data/sbtest/sbtest1.ibd (9437184 bytes)
+Space ID:    71355
+Pages:       576
+Page size:   16384 bytes
+FSP flags:   0x00004021 (post_antelope=true atomic_blobs=true data_dir=false shared=false temporary=false encryption=false sdi=true)
+SDI:         present (written by MySQL 8.4.3, dd_version 80300, sdi_version 80019)
+Tables in SDI: 1
+Row format:  DYNAMIC
+Clustered index: "PRIMARY" (id 71531), root page 4
+Secondary indexes: 1
+Physical fields: 6 (4 output)
+=== innodump 0.7.7 ===
+Table:       sbtest.sbtest1 (row_format=DYNAMIC)
+Columns:     4 output (6 total incl. system/hidden)
+Schema file: sqldump_2026-09-08_22.17/sbtest.sbtest1-schema.sql
+Data file:   sqldump_2026-09-08_22.17/sbtest.sbtest1-data-deleted.sql (2100 delete-marked row(s) written)
 ```
 
 ## Build
@@ -140,6 +157,7 @@ innodump --file /path/to/table.ibd [options]
 | `--table NAME` | Which table to extract, if the file holds more than one - always required for a shared/common tablespace. Not usable with `--source-dir`, which always extracts every table it finds. |
 | `--limit N` | Stop after N rows (0 = all). |
 | `--ddl-only` | Only write the schema file(s); skip walking any table's data entirely. |
+| `--deleted-only` | Dump only rows still marked as delete-marked (deleted, but not yet purged/overwritten by InnoDB) instead of live rows - for forensic recovery of recently deleted data (see "Recovering deleted rows", below). The output data file's name gets a `-deleted` suffix, so it never collides with a normal dump of the same table. |
 | `--yes` | Overwrite existing output without prompting (also honored via `YES=1`). Without it: for `--format=sql`, an existing output file triggers an interactive y/N prompt, or - with no terminal to prompt on - a refusal naming the file(s) in question; for `--format=tsv`, the same, but checked only against the dump directory's own root metadata file (`@.json`), not every individual file it may end up writing. |
 | `--skip-corrupted` | On a corrupted leaf page, note it and carry on from the next page instead of stopping. |
 | `--no-progress` | Never draw the progress bar on stderr (also honored via `NO_PROGRESS=1`). |
@@ -629,6 +647,83 @@ TABLE` and every `INSERT`, exactly as `SELECT *` on the live table would be.
 - A row that fails to decode (corrupt data, or an unsupported nested case)
   is skipped with a warning printed to stderr and a `-- skipped a row ...`
   comment in the data file, rather than aborting the whole extraction.
+
+## Recovering deleted rows
+
+A `DELETE` doesn't remove a row from its leaf page right away. InnoDB
+first just flips that record's delete-mark bit and leaves the bytes in
+place; later, in the background, once no open transaction could still
+need the old version (InnoDB's MVCC undo/purge mechanism), a purge thread
+physically unlinks it from the page's live record chain - but even then
+it doesn't erase the bytes, it just adds that slot to the page's own
+*free list* so a future insert can reuse the space. And if enough of a
+page's records get purged, InnoDB can go a step further and merge what's
+left into a sibling page, deallocating the emptied one entirely -
+unlinking the whole page from the table's live leaf-page chain, again
+without erasing or reformatting it until it's claimed for something else.
+By default `innodump` skips all of this and only decodes live rows,
+exactly like a normal `SELECT` would. Pass `--deleted-only` to flip that
+around: it walks the same clustered index the same way, but instead
+recovers every row still recognizable as deleted, from any of three
+sources:
+
+- a **delete-marked** record still on the live record chain, on a page
+  still linked into the table's own live leaf level - deleted, but purge
+  hasn't gotten to it yet;
+- a **purged** record still sitting on such a page's own free list -
+  physically removed from the live record chain, but not yet overwritten
+  by a later insert;
+- either of the above, sitting on a page that's since been merged away
+  and deallocated - no longer linked into the table's live leaf level at
+  all, but not yet reformatted for something else.
+
+Either way the row's actual field bytes are untouched by the delete/purge
+itself (only a header pointer used for chain-linking gets rewritten), so
+a recovered row decodes with the exact same fidelity as a live one. Rows
+recovered from more than one of these sources can turn out byte-identical
+(a page split copies a record's bytes verbatim to the new page, so its
+old copy and its later, separately-deleted copy can both still be lying
+around) - `innodump` drops any such exact repeat itself, so the output
+only ever holds distinct rows; two rows that share a primary key but
+whose other columns differ are two genuinely different historical
+versions of that row, and both are kept.
+
+```
+$ innodump --file table.ibd --deleted-only
+=== innodump 0.7.9 ===
+Table:       sbtest.sbtest1 (row_format=DYNAMIC)
+Columns:     4 output (6 total incl. system/hidden)
+Schema file: sqldump_2026-09-08_21.04/sbtest.sbtest1-schema.sql
+Data file:   sqldump_2026-09-08_21.04/sbtest.sbtest1-data-deleted.sql (1000 delete-marked row(s) written)
+```
+
+The output data file's name always gets a `-deleted` suffix (`...-data-
+deleted.sql` for `--format=sql`, `<schema>@<table>-deleted.tsv` - and
+every other file `innodump` writes for that table - for `--format=tsv`),
+so a `--deleted-only` run never collides with, or gets collided into by,
+a normal dump of the same table written to the same `--out-dir`. The
+schema/DDL file itself is unaffected (a table's structure doesn't depend
+on whether you're after its live or its deleted rows).
+
+This only recovers what the file still happens to hold, and only for as
+long as it still holds it: a delete-marked-but-not-yet-purged record can
+be purged at any time, a purged record's slot (or a merged-away page's
+whole extent) can be reused for something else at any time, and InnoDB is
+also free to reorganize a page's free space wholesale (compacting or
+discarding what's on its free list) independently of any single record
+being reused - so there's no guaranteed recovery window, on any of the
+three sources above; the sooner you copy the file after the delete, the
+better the odds. A busy shared/system tablespace (`ibdata1`, see below)
+tends to reclaim space faster than a dedicated per-table file simply
+because more unrelated activity is competing for it. It's still bound by
+everything else in this README: it needs the same schema/SDI or `.frm`
+this tool always needs to make sense of a page's bytes, it's subject to
+the same corrupted/truncated-page handling (a deleted record on a page
+`--skip-corrupted` falls back to the same out-of-order full-file scan a
+badly truncated file does - see "Truncated files", below - and is
+recovered exactly the same way a live one would be), and - like every
+other mode - it's read-only best-effort extraction, not a substitute for
+a real backup (see the caveat at the top of this README).
 
 ## Corrupted pages
 
