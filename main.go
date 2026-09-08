@@ -61,7 +61,7 @@ const appName = "innodump"
 // The hardcoded fallback below is what a plain "go build"/"go install"
 // (no ldflags) prints instead - kept in sync with the latest tagged
 // release by hand.
-var version = "0.7.5"
+var version = "0.7.6"
 
 var (
 	filePath             = flag.String("file", "", "Path to the .ibd file to extract")

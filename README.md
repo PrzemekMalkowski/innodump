@@ -658,6 +658,34 @@ Note:        the source file looks truncated (not fully copied) - recovered ever
 line (`... [source file truncated]`) and once more in its final tally
 (`N source file(s) looked truncated ...`) if any were.
 
+### When even finding the leftmost leaf isn't possible
+
+The above covers a file that ends partway through the ordinary leaf-level
+walk, once it's under way. A more severely truncated file can end before
+that walk even starts: finding the correct starting point means
+navigating down from the root through the index's non-leaf levels first,
+and if *that* hits a page number past where the file ends (the root
+itself, or any page on the way down), there's no way to know which
+leaf page is the real leftmost one - so with `--skip-corrupted`,
+`innodump` instead falls back to reading every page the file actually
+has and decoding any leaf page it finds belonging to this table's index,
+in physical page order rather than key order:
+
+```
+warning: corrupted page 4 (index "PRIMARY", id 1586): can't navigate from the root to the leftmost leaf (page 1702109297 is past the end of the file (it holds only 54 page(s)) - the file looks truncated (not fully copied), rather than corrupted) - falling back to an out-of-order scan of every leaf page the file does hold
+Data file:   sqldump_.../schema.table-data.sql (1000 row(s) written, 1 corrupted page(s) skipped - see warnings above)
+Note:        the source file looks truncated (not fully copied) - recovered every row up to where it ends; anything stored after that point is missing.
+```
+
+This is a best-effort scan, not a validated walk: rows come out in
+whatever order the surviving leaf pages happen to sit in the file, not
+primary-key order, and there's no way to know whether a leaf page that
+should exist but doesn't survive belongs at the start, middle, or end of
+that order - all this tool can promise is that every row still present
+in the truncated file's own surviving pages is recovered. **Without**
+`--skip-corrupted`, this situation is still a hard failure, same as any
+other truncation.
+
 ## Performance
 
 Reading and validating each leaf page, and following its `FIL_PAGE_NEXT`

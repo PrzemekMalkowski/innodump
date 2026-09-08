@@ -5,6 +5,7 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -23,6 +24,16 @@ func truncatedReason(sp *Space, pageNo uint32) string {
 		"the file looks truncated (not fully copied), rather than corrupted", pageNo, sp.NumPages)
 }
 
+// errTruncated marks an error produced by truncatedReason - the file
+// itself doesn't hold the requested page at all, as opposed to a
+// checksum/structural failure on a page it does hold. WalkRows uses
+// errors.As to tell the two apart: only this one has a well-defined,
+// principled fallback (scanTruncatedLeaves) when leftmostLeaf can't even
+// navigate down to the correct starting page.
+type errTruncated struct{ reason string }
+
+func (e *errTruncated) Error() string { return e.reason }
+
 // readPageOrTruncated is Space.ReadPage with a clearer error for the
 // specific, common case of a page number the file doesn't hold at all
 // (see truncatedReason) - used where that's always fatal regardless of
@@ -30,7 +41,7 @@ func truncatedReason(sp *Space, pageNo uint32) string {
 // condition itself, since there it's instead recoverable.
 func readPageOrTruncated(sp *Space, pageNo uint32) ([]byte, error) {
 	if reason := truncatedReason(sp, pageNo); reason != "" {
-		return nil, fmt.Errorf("%s", reason)
+		return nil, &errTruncated{reason}
 	}
 	return sp.ReadPage(pageNo)
 }
@@ -190,6 +201,26 @@ type pageEvent struct {
 func WalkRows(sp *Space, t *Table, outCols []*Column, format outputFormat, skipCorrupted bool, onCorrupt func(CorruptPage), fn func(RowOrError) bool) error {
 	leaf, err := leftmostLeaf(sp, t)
 	if err != nil {
+		var te *errTruncated
+		if skipCorrupted && errors.As(err, &te) {
+			// Even navigating from the root down to the correct leftmost
+			// leaf isn't possible - some page along the way (maybe the
+			// root itself) is past where this truncated file ends. There's
+			// no way to resume the ordinary key-ordered walk from here,
+			// but --skip-corrupted's job is still "recover what's
+			// possible": fall back to reading every page the file DOES
+			// have and picking out whichever ones happen to be leaf pages
+			// of this index - see scanTruncatedLeaves.
+			if onCorrupt != nil {
+				onCorrupt(CorruptPage{
+					PageNo: t.RootPage,
+					Reason: fmt.Sprintf("can't navigate from the root to the leftmost leaf (%s) - "+
+						"falling back to an out-of-order scan of every leaf page the file does hold", te.reason),
+					Truncated: true,
+				})
+			}
+			return scanTruncatedLeaves(sp, t, outCols, format, fn)
+		}
 		return fmt.Errorf("finding the leftmost leaf page: %w", err)
 	}
 	shape := tableZipShape(t)
@@ -306,6 +337,62 @@ func collectBatch(sp *Space, t *Table, shape zipIndexShape, skipCorrupted bool, 
 		*pageNo = filNextPage(page)
 	}
 	return batch, nil
+}
+
+// scanTruncatedLeaves is WalkRows' last-resort fallback for a tablespace
+// so badly truncated that even navigating from the root to the correct
+// leftmost leaf isn't possible (see leftmostLeaf/errTruncated): normal
+// key order depends on that navigation, so instead this reads every page
+// the file actually has, page 0 through sp.NumPages-1, and decodes any
+// leaf page it finds belonging to this index (matching FIL_PAGE_TYPE,
+// index id, and level 0 - the same checks collectBatch applies to a page
+// it already knows is part of this index's leaf chain), in physical
+// page-number order rather than key order. Every other page - non-leaf
+// pages of this index, pages belonging to a different index or table
+// sharing this tablespace, FSP/INODE/undo bookkeeping pages, a page that
+// fails its own checksum - is silently skipped: this is a best-effort
+// scan of what a badly truncated file happens to still hold, not a
+// validated walk, so there's no single well-defined "corrupt page" to
+// report for any of them the way there is during the normal walk.
+func scanTruncatedLeaves(sp *Space, t *Table, outCols []*Column, format outputFormat, fn func(RowOrError) bool) error {
+	shape := tableZipShape(t)
+	for pn := uint32(0); pn < sp.NumPages; pn++ {
+		raw, err := sp.ReadPage(pn)
+		if err != nil {
+			continue
+		}
+		if pc := checkPage(raw, sp.Compressed, sp.Flags.fullCRC32); !pc.OK {
+			continue
+		}
+		if filType(raw) != filPageIndex || pageGetIndexID(raw) != t.IndexID || pageGetLevel(raw) != 0 {
+			continue
+		}
+		page, err := sp.Decompress(raw, shape)
+		if err != nil {
+			continue
+		}
+		var offs []uint32
+		walkRecords(page, sp.PageSize, func(recOff uint32) bool {
+			if !recDeleted(page, recOff) {
+				offs = append(offs, recOff)
+			}
+			return true
+		})
+		if len(offs) == 0 {
+			continue
+		}
+		ev := pageEvent{page: page, rows: make([]RowOrError, len(offs))}
+		for i, recOff := range offs {
+			ev.rows[i] = RowOrError{PageNo: pn, RecOff: recOff}
+		}
+		decodeBatch(sp, t, outCols, format, []pageEvent{ev})
+		for _, roe := range ev.rows {
+			if !fn(roe) {
+				return nil
+			}
+		}
+	}
+	return nil
 }
 
 // decodeBatch fills in every rows[i].Row/Err left blank by collectBatch (a
