@@ -65,6 +65,46 @@ NULL bitmap and variable-length field list exactly as InnoDB itself does.
 Columns stored off-page (long BLOB/TEXT/JSON values) are followed through
 MySQL 8.0's LOB page format to recover the full value.
 
+## Example runs
+
+```
+$ innodump --file instant_t.ibd --skip-corrupted
+=== innodump 0.7.6 ===
+Table:       db1.instant_t (row_format=DYNAMIC)
+Columns:     29 output (31 total incl. system/hidden)
+warning: corrupted page 100 (index "PRIMARY", id 943): LSN low bytes at the start and end of the page disagree
+Schema file: sqldump_2026-09-08_15.43/db1.instant_t-schema.sql
+Data file:   sqldump_2026-09-08_15.43/db1.instant_t-data.sql (100680 row(s) written, 1 corrupted page(s) skipped - see warnings above)
+```
+
+```
+$ innodump --file child_1.ibd --skip-corrupted
+=== innodump 0.7.6 ===
+Table:       db1.child_1 (row_format=DYNAMIC)
+Columns:     2 output (4 total incl. system/hidden)
+warning: corrupted page 1996 (index "PRIMARY", id 693): page 1996 is past the end of the file (it holds only 1920 page(s)) - the file looks truncated (not fully copied), rather than corrupted
+Schema file: sqldump_2026-09-08_15.44/db1.child_1-schema.sql
+Data file:   sqldump_2026-09-08_15.44/db1.child_1-data.sql (3721 row(s) written, 1 corrupted page(s) skipped - see warnings above)
+Note:        the source file looks truncated (not fully copied) - recovered every row up to where it ends; anything stored after that point is missing.
+```
+
+```
+$ innodump --source-dir /data/ --format tsv
+=== innodump 0.7.6 ===
+Following /data/ recursively — recognized as a single instance's datadir (found ibdata1), so every InnoDB table found inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) will be dumped.
+Source:      /data/ (8 .ibd file(s), 129 .frm-only table(s) to resolve via ibdata1 found)
+  db1.orders_and_vectors: 0 row(s)
+  db1.t1: 3 row(s)
+  my_db_1.t2: 3 row(s)
+  my_db_1.test9: 2 row(s)
+Files:       8/8 processed
+Tables:      4 extracted
+Skipped:     4 system-schema table(s) skipped (mysql/sys/performance_schema/information_schema/ndbinfo) - pass --include-system-schemas to include them
+Note:        129 .frm file(s) with no matching .ibd had no InnoDB entry in ibdata1's own dictionary either - likely a non-InnoDB table, a VIEW, or a general tablespace this tool can't reach - skipped
+Rows:        8 written
+Output:      tsvdump_2026-09-08_15.59
+```
+
 ## Build
 
 Requires Go 1.21+. Pulls in one dependency,
