@@ -269,15 +269,18 @@ func WalkRows(sp *Space, t *Table, outCols []*Column, format outputFormat, skipC
 		workers = 1
 	}
 
-	// visited records every page number the ordinary walk below actually
-	// reads, so that --deleted-only's own supplementary scan (below) never
-	// re-reads (and so never double-reports) a page the ordinary walk
-	// already covered. Left nil - collectBatch skips populating it, at
-	// zero cost - unless deletedOnly needs it.
-	var visited map[uint32]bool
-	if deletedOnly {
-		visited = make(map[uint32]bool, sp.NumPages)
-	}
+	// visited records every page number the ordinary walk below has
+	// already processed. This is always needed, regardless of
+	// deletedOnly: it's what lets collectBatch notice a leaf chain that
+	// loops back on itself (a corrupted, or maliciously crafted,
+	// FIL_PAGE_NEXT pointer aiming back at a page already walked) and stop
+	// there, rather than following it around forever, endlessly
+	// re-decoding and re-emitting the same rows - see the cycle check in
+	// collectBatch. With --deleted-only, the same map doubles as the skip
+	// list for the supplementary scan below (scanUnlinkedLeaves), so it
+	// never re-reads (and so never double-reports) a page the ordinary
+	// walk already covered.
+	visited := make(map[uint32]bool, sp.NumPages)
 
 	pageNo := leaf
 	for pageNo != filNull {
@@ -369,9 +372,31 @@ func collectBatch(sp *Space, t *Table, shape zipIndexShape, skipCorrupted, delet
 	batch := make([]pageEvent, 0, maxPages)
 	for len(batch) < maxPages && *pageNo != filNull {
 		pn := *pageNo
-		if visited != nil {
-			visited[pn] = true
+		if visited[pn] {
+			// The leaf chain has looped back to a page this same walk
+			// already processed. A genuine InnoDB leaf chain never
+			// revisits a page, so this only happens when a FIL_PAGE_NEXT
+			// pointer is corrupted (as here: the fallback for a page that
+			// failed validation still trusts that page's own next-page
+			// pointer to keep going - see below - and a damaged one can
+			// easily point back into the chain instead of forward) or the
+			// file was deliberately crafted to contain a cycle. Following
+			// it anyway would re-decode and re-emit the same rows forever,
+			// so - like a chain that runs off the end of the file
+			// (truncatedReason, below) - this is always where the walk
+			// ends, never something to skip past even with
+			// --skip-corrupted: there's no way to make forward progress
+			// out of a loop.
+			*pageNo = filNull
+			reason := fmt.Sprintf("its FIL_PAGE_NEXT pointer loops back to page %d, already visited earlier in this same walk - the leaf chain is corrupted", pn)
+			if !skipCorrupted {
+				return batch, fmt.Errorf("page %d (index %q, id %d): %s", pn, t.IndexName, t.IndexID, reason)
+			}
+			cp := CorruptPage{PageNo: pn, Reason: reason}
+			batch = append(batch, pageEvent{corrupt: &cp})
+			return batch, nil
 		}
+		visited[pn] = true
 		if reason := truncatedReason(sp, pn); reason != "" {
 			// The file itself doesn't hold this page at all - not a bad
 			// checksum or a wrong page type on a page that IS there, but
