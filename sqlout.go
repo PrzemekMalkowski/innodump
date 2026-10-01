@@ -23,6 +23,14 @@ func OutputColumns(t *Table) []*Column {
 	return out
 }
 
+// convertMyISAMToInnoDB is --myisam-to-innodb (main.go): when set,
+// GenerateDDL renders every MyISAM table as ENGINE=InnoDB instead - see
+// GenerateDDL and myisamToInnoDBAutoIncKey for what else that changes.
+// Only the generated DDL is affected; the rows themselves are decoded and
+// written exactly the same either way, and load into the converted table
+// unchanged.
+var convertMyISAMToInnoDB bool
+
 func backquote(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
 }
@@ -69,7 +77,7 @@ func columnHasCharset(ddType uint32) bool {
 // tool's README/--help for the full list.
 func GenerateDDL(t *Table) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "-- Reconstructed by %s from the table's embedded SDI.\n", appName)
+	fmt.Fprintf(&b, "-- Reconstructed by %s from the table's own dictionary information (SDI/.frm).\n", appName)
 	fmt.Fprintf(&b, "-- Best-effort DDL: column types, NULL-ability, AUTO_INCREMENT, comments,\n")
 	fmt.Fprintf(&b, "-- generated columns, the PRIMARY KEY, secondary indexes, FOREIGN KEY\n")
 	fmt.Fprintf(&b, "-- constraints, and the default charset/collation are reproduced; DEFAULT\n")
@@ -77,6 +85,19 @@ func GenerateDDL(t *Table) string {
 	fmt.Fprintf(&b, "-- the highest value seen in the data plus one, not the server's persisted\n")
 	fmt.Fprintf(&b, "-- counter (the SDI doesn't carry that) - it may be behind if rows were\n")
 	fmt.Fprintf(&b, "-- deleted from the high end.\n")
+	engine := t.Engine
+	var autoIncKey string
+	if t.Engine == "MyISAM" && convertMyISAMToInnoDB {
+		engine = "InnoDB"
+		autoIncKey = myisamToInnoDBAutoIncKey(t)
+		fmt.Fprintf(&b, "-- Converted from ENGINE=MyISAM to ENGINE=InnoDB (--myisam-to-innodb); MyISAM's own\n")
+		fmt.Fprintf(&b, "-- ROW_FORMAT (FIXED/DYNAMIC) is dropped, leaving the server's InnoDB default.\n")
+		if autoIncKey != "" {
+			fmt.Fprintf(&b, "-- KEY %s was added: InnoDB requires an AUTO_INCREMENT column to lead some\n", backquote(autoIncKey))
+			fmt.Fprintf(&b, "-- index, which MyISAM doesn't. Note that InnoDB's counter is table-wide, not\n")
+			fmt.Fprintf(&b, "-- per-group like MyISAM's for an AUTO_INCREMENT that isn't a key's first column.\n")
+		}
+	}
 	fmt.Fprintf(&b, "CREATE TABLE %s.%s (\n", backquote(t.SchemaRef), backquote(t.Name))
 
 	var lines []string
@@ -123,6 +144,13 @@ func GenerateDDL(t *Table) string {
 		}
 		if !c.IsNullable {
 			l.WriteString(" NOT NULL")
+		} else if c.DDType == ddTimestamp || c.DDType == ddTimestamp2 {
+			// SHOW CREATE TABLE's own rule: a nullable TIMESTAMP always says
+			// so - without it, a server running with
+			// explicit_defaults_for_timestamp=OFF (every 5.x default)
+			// silently makes the column NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			// and every NULL loaded into it turns into the load time.
+			l.WriteString(" NULL")
 		}
 		if c.IsAutoIncrement {
 			l.WriteString(" AUTO_INCREMENT")
@@ -133,7 +161,11 @@ func GenerateDDL(t *Table) string {
 		lines = append(lines, l.String())
 	}
 	if t.HasExplicitPK {
-		lines = append(lines, "  PRIMARY KEY ("+secondaryIndexColumnList(t.PKFieldsAsColumns())+")")
+		if t.PKIsUniqueKey {
+			lines = append(lines, "  UNIQUE KEY "+backquote(t.IndexName)+" ("+secondaryIndexColumnList(t.PKFieldsAsColumns())+")")
+		} else {
+			lines = append(lines, "  PRIMARY KEY ("+secondaryIndexColumnList(t.PKFieldsAsColumns())+")")
+		}
 	}
 	for _, si := range t.SecondaryIndexes {
 		kind := "KEY"
@@ -145,11 +177,23 @@ func GenerateDDL(t *Table) string {
 		case si.Spatial:
 			kind = "SPATIAL KEY"
 		}
-		line := fmt.Sprintf("  %s %s (%s)", kind, backquote(si.Name), secondaryIndexColumnList(si.Columns))
+		cols := si.Columns
+		if si.Fulltext || si.Spatial {
+			// Neither takes a prefix length (MySQL rejects one); whatever
+			// length the dictionary recorded for their key parts is internal.
+			cols = make([]SecondaryIndexColumn, len(si.Columns))
+			for i, c := range si.Columns {
+				cols[i] = SecondaryIndexColumn{Col: c.Col}
+			}
+		}
+		line := fmt.Sprintf("  %s %s (%s)", kind, backquote(si.Name), secondaryIndexColumnList(cols))
 		if !si.Visible {
 			line += " /*!80000 INVISIBLE */"
 		}
 		lines = append(lines, line)
+	}
+	if autoIncKey != "" {
+		lines = append(lines, fmt.Sprintf("  KEY %s (%s)", backquote(autoIncKey), backquote(t.AutoIncrementCol.Name)))
 	}
 	for _, fk := range t.ForeignKeys {
 		refTable := backquote(fk.ReferencedTable)
@@ -178,9 +222,20 @@ func GenerateDDL(t *Table) string {
 		lines = append(lines, line)
 	}
 	b.WriteString(strings.Join(lines, ",\n"))
-	b.WriteString("\n) ENGINE=InnoDB")
-	if t.RowFormat == rowFormatCompact { // DYNAMIC is the server default; omit it
-		b.WriteString(" ROW_FORMAT=COMPACT")
+	fmt.Fprintf(&b, "\n) ENGINE=%s", engine)
+	switch engine {
+	case "MyISAM":
+		// SHOW CREATE TABLE only states ROW_FORMAT= when it differs from
+		// what MyISAM would pick on its own: FIXED if every column is
+		// fixed-width (no VARCHAR/BLOB/TEXT), DYNAMIC otherwise - see
+		// myisamDefaultRowFormat.
+		if t.RowFormat != myisamDefaultRowFormat(t) {
+			b.WriteString(" ROW_FORMAT=" + rowFormatName(t.RowFormat))
+		}
+	default: // InnoDB
+		if t.RowFormat == rowFormatCompact { // DYNAMIC is the server default; omit it
+			b.WriteString(" ROW_FORMAT=COMPACT")
+		}
 	}
 	if t.AutoIncrementNext != nil {
 		fmt.Fprintf(&b, " AUTO_INCREMENT=%d", *t.AutoIncrementNext)
@@ -203,8 +258,43 @@ func GenerateDDL(t *Table) string {
 		// uca1400Charset), so this
 		// can only state the charset, not COLLATE=<the real collation>.
 	}
+	// A partitioned table's PARTITION BY clause comes last, after every
+	// table option, exactly where SHOW CREATE TABLE puts it (partition.go).
+	b.WriteString(t.PartitionClause)
 	b.WriteString(";\n")
 	return b.String()
+}
+
+// myisamToInnoDBAutoIncKey returns the name of the extra KEY a MyISAM
+// table converted to InnoDB (--myisam-to-innodb) needs for its
+// AUTO_INCREMENT column, or "" if it needs none. MyISAM accepts an
+// AUTO_INCREMENT column anywhere in a multi-column key - PRIMARY KEY
+// (grp, id) with id AUTO_INCREMENT gives each grp its own sequence - but
+// InnoDB refuses the whole CREATE TABLE ("there can be only one auto
+// column and it must be defined as a key") unless that column is the
+// first part of at least one index, so this adds a plain KEY on it alone.
+// The name is the column's own, as MySQL itself would pick for an unnamed
+// KEY (col), unless an index already uses it.
+func myisamToInnoDBAutoIncKey(t *Table) string {
+	col := t.AutoIncrementCol
+	if col == nil {
+		return ""
+	}
+	if t.HasExplicitPK && len(t.PKFields) > 0 && t.PKFields[0].Col == col {
+		return ""
+	}
+	taken := map[string]bool{"primary": true}
+	for _, si := range t.SecondaryIndexes {
+		taken[strings.ToLower(si.Name)] = true
+		if !si.Fulltext && !si.Spatial && len(si.Columns) > 0 && si.Columns[0].Col == col {
+			return ""
+		}
+	}
+	name := col.Name
+	for i := 2; taken[strings.ToLower(name)]; i++ {
+		name = fmt.Sprintf("%s_%d", col.Name, i)
+	}
+	return name
 }
 
 // PKFieldsAsColumns adapts t.PKFields to the shape indexColumnList expects.
@@ -220,8 +310,8 @@ func secondaryIndexColumnList(cols []SecondaryIndexColumn) string {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		p := backquote(c.Col.Name)
-		if c.PrefixLen > 0 {
-			p += fmt.Sprintf("(%d)", c.PrefixLen)
+		if n := ddlPrefixLen(c.Col, c.PrefixLen); n > 0 {
+			p += fmt.Sprintf("(%d)", n)
 		}
 		if c.Desc {
 			p += " DESC"
@@ -229,6 +319,41 @@ func secondaryIndexColumnList(cols []SecondaryIndexColumn) string {
 		parts[i] = p
 	}
 	return strings.Join(parts, ",")
+}
+
+// isBlobFamily reports whether ddType is a BLOB/TEXT-family column type -
+// one that can only ever be indexed through a prefix.
+func isBlobFamily(ddType uint32) bool {
+	switch ddType {
+	case ddTinyBlob, ddBlob, ddMediumBlob, ddLongBlob:
+		return true
+	}
+	return false
+}
+
+// ddlPrefixLen turns a key part's stored prefix length (in bytes, as both
+// the SDI and a .frm record it, and as InnoDB's own record decoding needs
+// it) into what a CREATE TABLE key definition takes - 0 for "no prefix",
+// else a length in characters: a prefix as long as the whole column
+// (InnoDB's own PK decoding keeps one for every long column - see
+// BuildTable) is no prefix at all, and a multi-byte charset's byte count
+// is divided back down by its bytes-per-character, exactly as SHOW CREATE
+// TABLE does (key_part->length / charset->mbmaxlen). Printing the raw
+// byte count instead would make a utf8mb3 VARCHAR(255) key's full-column
+// "prefix" read 765, which MySQL rejects outright ("Incorrect prefix key").
+func ddlPrefixLen(col *Column, prefixLen uint32) uint32 {
+	if prefixLen == 0 {
+		return 0
+	}
+	if !isBlobFamily(col.DDType) && prefixLen >= col.ColLen {
+		return 0
+	}
+	if columnHasCharset(col.DDType) && !col.IsBinary() {
+		if info, ok := collationInfoFor(col.CollationID); ok && info.max > 1 {
+			prefixLen /= uint32(info.max)
+		}
+	}
+	return prefixLen
 }
 
 // InsertPrefix returns "INSERT INTO `schema`.`table` (`c1`,`c2`,...) VALUES ".

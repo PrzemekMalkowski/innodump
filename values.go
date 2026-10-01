@@ -41,6 +41,26 @@ func decodeUnsignedBE(b []byte) uint64 {
 	return v
 }
 
+// decodeUnsignedLE reads a plain little-endian n-byte unsigned integer -
+// MyISAM's own (and MEMORY's, and row-based binlog images') native
+// encoding for fixed-width integers and ENUM/SET indexes, unlike InnoDB's
+// big-endian, sign-flipped one above (see myisam.go's decodeMyISAMField).
+func decodeUnsignedLE(b []byte) uint64 {
+	var v uint64
+	for i := len(b) - 1; i >= 0; i-- {
+		v = v<<8 | uint64(b[i])
+	}
+	return v
+}
+
+// decodeSignedLE reads a little-endian n-byte two's-complement integer,
+// with no sign-bit flip - see decodeUnsignedLE.
+func decodeSignedLE(b []byte) int64 {
+	v := decodeUnsignedLE(b)
+	shift := uint(64 - len(b)*8)
+	return int64(v<<shift) >> shift
+}
+
 // decodeField renders one non-NULL physical field as a SQL literal, or (with
 // format == formatTSV) as one MySQL-Shell-dump-compatible TSV field - see
 // tsvdump.go's package comment for that dialect's exact escaping rules. sp is
@@ -88,8 +108,14 @@ func decodeField(sp *Space, col *Column, page []byte, fr fieldRange, format outp
 		return dateLiteral(decodeTimestamp2(full, int(col.DatetimePrec)), format), nil
 	case ddTime2:
 		return dateLiteral(decodeTime2(full, int(col.DatetimePrec)), format), nil
-	case ddDate, ddTime, ddDatetime, ddTimestamp:
-		return "", fmt.Errorf("column %q uses a pre-5.6 temporal storage format that v1 does not decode", col.Name)
+	case ddDatetime:
+		return dateLiteral(decodeOldDatetime(decodeSignedBE(full)), format), nil
+	case ddTime:
+		return dateLiteral(decodeOldTime(decodeSignedBE(full)), format), nil
+	case ddDate:
+		return dateLiteral(decodeOldDate(decodeSignedBE(full)), format), nil
+	case ddTimestamp:
+		return dateLiteral(decodeOldTimestamp(uint32(decodeUnsignedBE(full))), format), nil
 
 	case ddFloat:
 		if len(full) < 4 {

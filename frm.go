@@ -10,11 +10,17 @@
 // trusting any of the offsets below - see this tool's own development
 // history for the field-by-field trace that confirmed each one.
 //
+// The same parser (readFRMDefinition) also serves a pre-8.0 MyISAM table's
+// .frm (parseMyISAMFRM, used by myisam.go) - everything up to the column
+// and key definitions is engine-independent; only what each engine then
+// needs on top (InnoDB's clustered index and system columns, MyISAM's row
+// format) differs.
+//
 // Deliberately out of scope, consistent with the rest of this tool's
 // "detect and report" philosophy: generated/virtual columns (5.7.6+;
 // rejected explicitly rather than mis-parsed - decoding them needs the
 // separate gcol_screen section this file doesn't read), views, and any
-// .frm not immediately identifiable as a plain InnoDB table (wrong magic,
+// .frm not immediately identifiable as a plain InnoDB/MyISAM table (wrong magic,
 // too old a version, wrong storage engine, or a "legacy field-position"
 // scheme old enough to need the expensive find_field() reconciliation
 // open_binary_frm falls back to - vanishingly rare for anything created on
@@ -358,7 +364,8 @@ func buildFRMColumn(f frmField, ordinal uint32, intervals [][]string) (ddColumnJ
 	case ddFloat, ddDouble:
 		c.NumericScale = decimals
 	case ddTimestamp, ddDatetime, ddTime, ddDate:
-		return ddColumnJSON{}, fmt.Errorf("column %q uses a pre-5.6.4 temporal storage format that v1 does not decode (ALTER TABLE ... FORCE would upgrade it)", f.name)
+		// Pre-5.6.4 temporal storage (see temporal.go's decodeOldXxx):
+		// no fractional seconds, so nothing beyond the type itself to carry.
 	case ddTimestamp2:
 		if f.length > maxDatetimeWidth {
 			c.DatetimePrecision = f.length - 1 - maxDatetimeWidth
@@ -431,8 +438,14 @@ func frmColumnTypeText(c *ddColumnJSON, f frmField) string {
 		return numSuffix(fmt.Sprintf("decimal(%d,%d)", c.NumericPrecision, c.NumericScale))
 	case ddYear:
 		return "year(4)"
-	case ddNewdate:
+	case ddNewdate, ddDate:
 		return "date"
+	case ddTime:
+		return "time"
+	case ddDatetime:
+		return "datetime"
+	case ddTimestamp:
+		return "timestamp"
 	case ddTime2:
 		if c.DatetimePrecision > 0 {
 			return fmt.Sprintf("time(%d)", c.DatetimePrecision)
@@ -449,6 +462,9 @@ func frmColumnTypeText(c *ddColumnJSON, f frmField) string {
 		}
 		return "timestamp"
 	case ddVarchar:
+		if isBinary {
+			return fmt.Sprintf("varbinary(%d)", c.CharLength)
+		}
 		return fmt.Sprintf("varchar(%d)", charLen())
 	case ddVarString, ddString:
 		if isBinary {
@@ -544,21 +560,177 @@ func legacyRowFormat(sp *Space, rootPage []byte) uint32 {
 	return rowFormatCompact
 }
 
-// parseFRM reads path (a MySQL 5.6/5.7 .frm file) and sp's guessed root
-// page, and returns the same *ddTableJSON shape LoadSDITables would, so it
-// flows into BuildTable completely unchanged - see the file comment.
-// parseFRM parses path (a table's .frm file) into the ddTableJSON shape
-// BuildTable expects. loc is nil for an ordinary file-per-table .ibd,
-// where sp IS that table's own tablespace and its clustered index root
-// page is found via the well-known "root page 3" convention
-// (guessLegacyRootPage); non-nil when the table's data instead lives in a
-// shared/system tablespace (sysdict.go's FindTableLocation), giving the
-// actual root page/index id its own SYS_INDEXES row recorded - the "page
-// 3" convention only ever held for a table's own dedicated file.
-func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) {
+// frmDefinition is the engine-independent part of one parsed .frm file:
+// the table's name, schema, comment, default collation, and columns
+// (already converted to ddColumnJSON), plus its raw key list and the two
+// header fields a caller needs to decide what to do with it - which
+// storage engine it describes, and its db_create_options bits. parseFRM
+// (InnoDB) and parseMyISAMFRM (MyISAM) each turn this into their own
+// engine's ddTableJSON shape.
+type frmDefinition struct {
+	table         *ddTableJSON // Indexes left empty - engine-specific, see parseFRM/parseMyISAMFRM
+	keys          []frmKey
+	legacyDBType  byte   // head[3], enum legacy_db_type
+	createOptions uint32 // head[30:32], db_create_options (HA_OPTION_* bits)
+	// partitionClause is a partitioned table's own "PARTITION BY ..."
+	// clause text, exactly as the server stored it (see
+	// frmPartitionClause); "" for a table that isn't partitioned.
+	partitionClause string
+	// partDBType is head[61], default_part_db_type: the storage engine of
+	// a partitioned table's partitions, which legacyDBType can't say
+	// itself when the table uses the generic partitioning engine (5.6's
+	// ha_partition, legacyDBTypePartitioned).
+	partDBType byte
+}
+
+// engineIsInnoDB reports whether def describes an InnoDB table - a plain
+// one, a 5.7 natively partitioned one (legacy type InnoDB, plus a
+// partition clause), or a 5.6-style one whose partitions are InnoDB
+// tables under the generic partitioning engine.
+func (def *frmDefinition) engineIsInnoDB() bool {
+	return def.legacyDBType == legacyDBTypeInnoDB ||
+		(def.legacyDBType == legacyDBTypePartitioned && def.partDBType == legacyDBTypeInnoDB)
+}
+
+// frmPartitionClause reads the partition clause text out of a .frm's
+// "extra data segment" - open_binary_frm in sql/table.cc (5.7): the
+// segment, uint4korr(head+55) bytes long, sits right after the default
+// record (at uint2korr(head+6) + the form position length, plus
+// reclength), and holds a 2-byte-length connect string, a 2-byte-length
+// storage engine name ("partition" for 5.6-style partitioning), then a
+// 4-byte-length partition clause - " PARTITION BY RANGE (...) (PARTITION
+// p0 VALUES LESS THAN (...) ENGINE = InnoDB, ...)", exactly as the server
+// itself generated it. "" if there's none (not partitioned).
+func frmPartitionClause(data []byte) string {
+	head := data[:frmHeaderSize]
+	extraLen := frmU32(head[55:59])
+	if extraLen == 0 {
+		return ""
+	}
+	recordOffset := frmU16(head[6:8])
+	if frmU16(head[14:16]) == 0xffff {
+		recordOffset += frmU32(head[47:51])
+	} else {
+		recordOffset += frmU16(head[14:16])
+	}
+	start := uint64(recordOffset) + uint64(frmU16(head[16:18]))
+	end := start + uint64(extraLen)
+	if end > uint64(len(data)) {
+		return ""
+	}
+	seg := data[start:end]
+	pos := 0
+	skip2 := func() bool { // one 2-byte-length-prefixed string
+		if pos+2 > len(seg) {
+			return false
+		}
+		pos += 2 + int(frmU16(seg[pos:pos+2]))
+		return pos <= len(seg)
+	}
+	if !skip2() || !skip2() { // connect string, engine name
+		return ""
+	}
+	if pos+5 > len(seg) {
+		return ""
+	}
+	n := int(frmU32(seg[pos : pos+4]))
+	if n == 0 || pos+4+n > len(seg) {
+		return ""
+	}
+	return string(seg[pos+4 : pos+4+n])
+}
+
+// Legacy (pre-8.0) .frm storage engine codes - enum legacy_db_type in
+// mysql-server's sql/handler.h. Only the ones worth naming in an error
+// message are listed; any engine loaded as a plugin gets a dynamic code
+// (42 and up) instead.
+const (
+	legacyDBTypeHeap        = 6
+	legacyDBTypeMyISAM      = 9
+	legacyDBTypeMrgMyISAM   = 10
+	legacyDBTypeArchive     = 16
+	legacyDBTypeCSV         = 17
+	legacyDBTypeFederated   = 18
+	legacyDBTypeBlackhole   = 19
+	legacyDBTypePartitioned = 20
+)
+
+// legacyDBTypeName names a legacy_db_type code for error messages.
+func legacyDBTypeName(t byte) string {
+	switch t {
+	case legacyDBTypeHeap:
+		return "MEMORY"
+	case legacyDBTypeMyISAM:
+		return "MyISAM"
+	case legacyDBTypeMrgMyISAM:
+		return "MRG_MYISAM"
+	case legacyDBTypeInnoDB:
+		return "InnoDB"
+	case legacyDBTypeArchive:
+		return "ARCHIVE"
+	case legacyDBTypeCSV:
+		return "CSV"
+	case legacyDBTypeFederated:
+		return "FEDERATED"
+	case legacyDBTypeBlackhole:
+		return "BLACKHOLE"
+	case legacyDBTypePartitioned:
+		return "a partitioned table"
+	}
+	return fmt.Sprintf("legacy type %d", t)
+}
+
+// decodeMySQLFilename reverses the one part of MySQL's filename-safe
+// identifier encoding (my_charset_filename, used for every database and
+// table directory/file name since 5.1) that real-world names actually
+// hit: "@" followed by four hex digits encodes one character by its own
+// Unicode code point - "@0020" for a space, "@002d" for "-", and so on -
+// so a table created as `TABLE 75` lives in "TABLE@002075.frm". The
+// encoding's other, two-character "@xy" form (accented Latin, Greek,
+// Cyrillic, full-width letters) is left as-is.
+func decodeMySQLFilename(name string) string {
+	if !strings.Contains(name, "@") {
+		return name
+	}
+	var b strings.Builder
+	for i := 0; i < len(name); i++ {
+		if name[i] == '@' && i+5 <= len(name) {
+			var cp rune
+			ok := true
+			for _, h := range name[i+1 : i+5] {
+				switch {
+				case h >= '0' && h <= '9':
+					cp = cp<<4 | (h - '0')
+				case h >= 'a' && h <= 'f':
+					cp = cp<<4 | (h - 'a' + 10)
+				case h >= 'A' && h <= 'F':
+					cp = cp<<4 | (h - 'A' + 10)
+				default:
+					ok = false
+				}
+			}
+			if ok {
+				b.WriteRune(cp)
+				i += 4
+				continue
+			}
+		}
+		b.WriteByte(name[i])
+	}
+	return b.String()
+}
+
+// readFRMDefinition parses path (a MySQL 5.6/5.7 or MariaDB .frm file)
+// into a frmDefinition, rejecting anything that isn't a plain table
+// definition this file knows how to read - but, unlike parseFRM, not
+// checking which storage engine it belongs to.
+func readFRMDefinition(path string) (*frmDefinition, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
+	}
+	if bytesHasPrefix(data, []byte("TYPE=VIEW")) {
+		return nil, fmt.Errorf(".frm file is a VIEW, not a table")
 	}
 	if len(data) < frmHeaderSize {
 		return nil, fmt.Errorf(".frm file is too short to be valid")
@@ -566,9 +738,6 @@ func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) 
 	head := data[:frmHeaderSize]
 	if head[0] != 0xFE || head[1] != 1 {
 		return nil, fmt.Errorf(".frm file has an unrecognized header (not a MySQL table definition)")
-	}
-	if bytesHasPrefix(data, []byte("TYPE=VIEW")) {
-		return nil, fmt.Errorf(".frm file is a VIEW, not a table")
 	}
 	frmVer := head[2]
 	if frmVer == frmVerTrueVarchar-1 && head[33] == 5 {
@@ -584,9 +753,6 @@ func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) 
 	newFrmVer := int(frmVer) - frmVerBase
 	if newFrmVer < 3 {
 		return nil, fmt.Errorf(".frm file format (version %d) is not supported (v1 limitation)", frmVer)
-	}
-	if head[3] != legacyDBTypeInnoDB {
-		return nil, fmt.Errorf(".frm file's storage engine (legacy type %d) is not InnoDB", head[3])
 	}
 	if head[27] <= 1 {
 		return nil, fmt.Errorf(".frm file predates a field-position feature this tool relies on; an ALTER TABLE ... FORCE on the original server would rewrite it")
@@ -635,34 +801,118 @@ func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) 
 	// Neither the table name nor its schema are recorded inside the .frm
 	// itself - both come from its own path, mirroring MySQL's own
 	// directory-per-database, file-per-table convention
-	// (datadir/dbname/tablename.frm) that this .frm/.ibd pair must live
-	// under for findLegacyFRM to have found it there in the first place.
-	tableName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	schemaRef := filepath.Base(filepath.Dir(path))
+	// (datadir/dbname/tablename.frm) - decoded back from MySQL's
+	// filename-safe encoding (see decodeMySQLFilename).
+	tableName := decodeMySQLFilename(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+	schemaRef := decodeMySQLFilename(filepath.Base(filepath.Dir(path)))
 	rawTable := &ddTableJSON{Name: tableName, SchemaRef: schemaRef, Comment: tableComment, CollationID: uint64(tableCharsetID(head))}
-	colsByOpx := make([]ddColumnJSON, 0, numFields+3)
+	rawTable.Columns = make([]ddColumnJSON, 0, numFields+3)
 	for i, f := range fields {
 		c, err := buildFRMColumn(f, uint32(i), intervals)
 		if err != nil {
 			return nil, err
 		}
-		colsByOpx = append(colsByOpx, c)
+		rawTable.Columns = append(rawTable.Columns, c)
 	}
+	return &frmDefinition{table: rawTable, keys: keys, legacyDBType: head[3], createOptions: frmU16(head[30:32]),
+		partitionClause: frmPartitionClause(data), partDBType: head[61]}, nil
+}
 
-	// PRIMARY key detection: a key literally named "PRIMARY" (case-
-	// insensitive) - the overwhelming common case. Anything else (a
-	// UNIQUE NOT NULL key silently promoted to PK, no explicit PK at all)
-	// falls back to InnoDB's own hidden DB_ROW_ID, matching BuildTable's
-	// existing "!HasExplicitPK" path.
-	pkIdx := -1
+// frmPrimaryKeyIndex returns the position of keys' PRIMARY KEY, or -1:
+// a key literally named "PRIMARY" (case-insensitive) - the overwhelming
+// common case.
+func frmPrimaryKeyIndex(keys []frmKey) int {
 	for i, k := range keys {
 		if strings.EqualFold(k.name, "PRIMARY") {
-			pkIdx = i
-			break
+			return i
 		}
 	}
+	return -1
+}
 
+// frmPromotedUniqueKey returns the position of the key InnoDB uses as a
+// table's clustered index when it has no PRIMARY KEY, or -1 if there is
+// none (InnoDB then clusters on a hidden DB_ROW_ID): the first UNIQUE key
+// - in the .frm's own key order, which the server already sorted UNIQUE
+// NOT NULL keys to the front of - whose every part is a NOT NULL column
+// indexed in full, not by a prefix. Mirrors open_binary_frm's own
+// primary_key selection in sql/table.cc, which is what InnoDB is handed as
+// "the primary key" for such a table.
+func frmPromotedUniqueKey(keys []frmKey, cols []ddColumnJSON) int {
+	for i, k := range keys {
+		if !k.unique || k.fulltext || k.spatial || len(k.parts) == 0 {
+			continue
+		}
+		ok := true
+		for _, p := range k.parts {
+			if p.fieldnr == 0 || int(p.fieldnr) > len(cols) {
+				ok = false
+				break
+			}
+			col := cols[p.fieldnr-1]
+			if col.IsNullable || isBlobFamily(col.Type) || p.length != frmKeyLength(&col) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return i
+		}
+	}
+	return -1
+}
+
+// frmKeyLength is a column's full key length in bytes (Field::key_length()
+// in the server): its pack length, minus a VARCHAR's own length prefix.
+func frmKeyLength(col *ddColumnJSON) uint32 {
+	pl, err := packLength(col)
+	if err != nil {
+		return 0
+	}
+	if col.Type == ddVarchar {
+		if col.CharLength >= 256 {
+			return pl - 2
+		}
+		return pl - 1
+	}
+	return pl
+}
+
+// parseFRM reads path (a MySQL 5.6/5.7 .frm file) and returns the same
+// *ddTableJSON shape LoadSDITables would, so it flows into BuildTable
+// completely unchanged - see the file comment. loc is nil for an ordinary
+// file-per-table .ibd, where sp IS that table's own tablespace and its
+// clustered index root page is found via the well-known "root page 3"
+// convention (guessLegacyRootPage); non-nil when the table's data instead
+// lives in a shared/system tablespace (sysdict.go's FindTableLocation),
+// giving the actual root page/index id its own SYS_INDEXES row recorded -
+// the "page 3" convention only ever held for a table's own dedicated file.
+func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) {
+	def, err := readFRMDefinition(path)
+	if err != nil {
+		return nil, err
+	}
+	if !def.engineIsInnoDB() {
+		engine := legacyDBTypeName(def.legacyDBType)
+		if def.legacyDBType == legacyDBTypePartitioned {
+			engine = "a partitioned " + legacyDBTypeName(def.partDBType) + " table"
+		}
+		return nil, fmt.Errorf(".frm file's storage engine (%s) is not InnoDB", engine)
+	}
+	rawTable, keys := def.table, def.keys
+	colsByOpx := rawTable.Columns
+
+	// The clustered index: the PRIMARY KEY (frmPrimaryKeyIndex), else the
+	// UNIQUE key InnoDB promotes in its place (frmPromotedUniqueKey), else
+	// InnoDB's own hidden DB_ROW_ID, matching BuildTable's existing
+	// "!HasExplicitPK" path.
+	pkIdx := frmPrimaryKeyIndex(keys)
 	clust := ddIndexJSON{Name: "PRIMARY", Type: ddIndexPrimary}
+	if pkIdx < 0 {
+		if pkIdx = frmPromotedUniqueKey(keys, colsByOpx); pkIdx >= 0 {
+			clust = ddIndexJSON{Name: keys[pkIdx].name, Type: ddIndexUnique}
+		}
+	}
 	if pkIdx >= 0 {
 		k := keys[pkIdx]
 		for _, p := range k.parts {
@@ -672,7 +922,7 @@ func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) 
 			col := colsByOpx[p.fieldnr-1]
 			el := ddIndexElementJSON{ColumnOpx: p.fieldnr - 1}
 			fullLen, err := packLength(&col)
-			if err == nil && p.length < fullLen {
+			if err == nil && (p.length < fullLen || isBlobFamily(col.Type)) {
 				el.Length = p.length
 			}
 			clust.Elements = append(clust.Elements, el)
@@ -698,7 +948,7 @@ func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) 
 
 	for i, k := range keys {
 		if i == pkIdx || k.fulltext || k.spatial {
-			continue // fulltext/spatial rendering isn't attempted for the .frm path (v1 limitation)
+			continue // fulltext/spatial rendering isn't attempted for the InnoDB .frm path (v1 limitation)
 		}
 		idx := ddIndexJSON{Name: k.name, IsVisible: true}
 		if k.unique {
@@ -712,7 +962,9 @@ func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) 
 			}
 			col := colsByOpx[p.fieldnr-1]
 			el := ddIndexElementJSON{ColumnOpx: p.fieldnr - 1}
-			if fullLen, err := packLength(&col); err == nil && p.length < fullLen {
+			// A BLOB/TEXT key part is always a prefix, even though its
+			// length exceeds the column's own (tiny) in-record pack length.
+			if fullLen, err := packLength(&col); err == nil && (p.length < fullLen || isBlobFamily(col.Type)) {
 				el.Length = p.length
 			}
 			idx.Elements = append(idx.Elements, el)
@@ -741,6 +993,82 @@ func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) 
 		return nil, err
 	}
 	rawTable.RowFormat = legacyRowFormat(sp, rootRaw)
+	return rawTable, nil
+}
+
+// haOptionPackRecord is HA_OPTION_PACK_RECORD (my_base.h), the
+// db_create_options bit a .frm (and a .MYI's own header) sets when a
+// MyISAM table uses the DYNAMIC row format rather than FIXED.
+const haOptionPackRecord = 1
+
+// parseMyISAMFRM reads path (a pre-8.0 MySQL/MariaDB MyISAM table's .frm)
+// into the ddTableJSON shape BuildMyISAMTable expects - the same shape a
+// MySQL 8.0+ standalone .sdi unmarshals into (see myisam.go's
+// findMyISAMSchema). Unlike parseFRM there's no InnoDB-internal detail to
+// add (no clustered index root page, no DB_TRX_ID/DB_ROLL_PTR): a MyISAM
+// table's .frm columns are exactly its physical columns, and its keys
+// (FULLTEXT/SPATIAL included) come through as-is. RowFormat is set from
+// the .frm's own db_create_options (DYNAMIC if HA_OPTION_PACK_RECORD is
+// set, FIXED otherwise) - findMyISAMSchema overrides that from the .MYI
+// header when one is there, since only the .MYI records whether
+// myisampack has since compressed the table.
+func parseMyISAMFRM(path string) (*ddTableJSON, error) {
+	def, err := readFRMDefinition(path)
+	if err != nil {
+		return nil, err
+	}
+	if def.legacyDBType != legacyDBTypeMyISAM {
+		return nil, fmt.Errorf(".frm file's storage engine (%s) is not MyISAM", legacyDBTypeName(def.legacyDBType))
+	}
+	rawTable, keys := def.table, def.keys
+	rawTable.Engine = "MyISAM"
+	rawTable.RowFormat = rowFormatFixed
+	if def.createOptions&haOptionPackRecord != 0 {
+		rawTable.RowFormat = rowFormatDynamic
+	}
+
+	// BuildMyISAMTable expects a PRIMARY KEY (if any) as Indexes[0], same
+	// as an SDI lists it; every element's Length is the key part's own
+	// byte length, which BuildMyISAMTable compares against the column's
+	// own to tell a prefix key from a full-column one - also exactly as
+	// an SDI records it.
+	pkIdx := frmPrimaryKeyIndex(keys)
+	order := make([]int, 0, len(keys))
+	if pkIdx >= 0 {
+		order = append(order, pkIdx)
+	}
+	for i := range keys {
+		if i != pkIdx {
+			order = append(order, i)
+		}
+	}
+	for _, i := range order {
+		k := keys[i]
+		idx := ddIndexJSON{Name: k.name, IsVisible: true}
+		switch {
+		case i == pkIdx:
+			idx.Type = ddIndexPrimary
+		case k.fulltext:
+			idx.Type = ddIndexFulltext
+		case k.spatial:
+			idx.Type = ddIndexSpatial
+		case k.unique:
+			idx.Type = ddIndexUnique
+		default:
+			idx.Type = ddIndexMultiple
+		}
+		for _, p := range k.parts {
+			if p.fieldnr == 0 || int(p.fieldnr) > len(rawTable.Columns) {
+				return nil, fmt.Errorf("index %q references an out-of-range column", k.name)
+			}
+			el := ddIndexElementJSON{ColumnOpx: p.fieldnr - 1, Length: p.length}
+			if k.fulltext || k.spatial {
+				el.Length = 0 // never a prefix - see BuildMyISAMTable
+			}
+			idx.Elements = append(idx.Elements, el)
+		}
+		rawTable.Indexes = append(rawTable.Indexes, idx)
+	}
 	return rawTable, nil
 }
 

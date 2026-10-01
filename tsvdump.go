@@ -298,7 +298,7 @@ func (d *TSVDump) ensureSchema(schema string) (*tsvSchemaState, error) {
 // same directory. Returns the same row/page/truncated-file counts
 // WalkRows' caller in main.go already tracks for the SQL path (see
 // writeSQLTable's own comment on truncated).
-func (d *TSVDump) AddTable(sp *Space, t *Table, outCols []*Column, ddlOnly bool, limitRows int,
+func (d *TSVDump) AddTable(rw RowWalker, t *Table, outCols []*Column, ddlOnly bool, limitRows int,
 	skipCorrupted, deletedOnly bool, progressLabel string, sourceVersionID uint32,
 	compression compressionKind, compressionLevel int) (nOK, nErr, nCorruptPages int, truncated bool, err error) {
 	d.noteSourceVersion(sourceVersionID)
@@ -342,7 +342,7 @@ func (d *TSVDump) AddTable(sp *Space, t *Table, outCols []*Column, ddlOnly bool,
 		}
 		var maxAutoInc uint64
 
-		pr := newProg(progressLabel, int64(sp.NumPages))
+		pr := newProg(progressLabel, rw.ProgressTotal)
 		onCorrupt := func(cp CorruptPage) {
 			nCorruptPages++
 			if cp.Truncated {
@@ -351,13 +351,13 @@ func (d *TSVDump) AddTable(sp *Space, t *Table, outCols []*Column, ddlOnly bool,
 			// pr.Warnf (not a plain Fprintf) clears the bar's own
 			// in-progress line first, so this can't land mid-redraw and
 			// splice into it - see progress.go.
-			pr.Warnf("%s corrupted page %d (index %q, id %d): %s\n", warn("warning:"), cp.PageNo, t.IndexName, t.IndexID, cp.Reason)
+			pr.Warnf("%s corrupted %s: %s\n", warn("warning:"), t.corruptUnitLabel(cp.PageNo), cp.Reason)
 		}
 		onRow := func(roe RowOrError) bool {
-			pr.set(int64(roe.PageNo))
+			pr.set(roe.ProgressBase + int64(roe.PageNo))
 			if roe.Err != nil {
 				nErr++
-				pr.Warnf("%s page %d rec@0x%x: %v\n", warn("warning:"), roe.PageNo, roe.RecOff, roe.Err)
+				pr.Warnf("%s %s: %v\n", warn("warning:"), t.corruptRowLabel(roe.PageNo, roe.RecOff), roe.Err)
 				return limitRows == 0 || nOK+nErr < limitRows
 			}
 			line := strings.Join(roe.Row.Values, "\t") + "\n"
@@ -379,7 +379,7 @@ func (d *TSVDump) AddTable(sp *Space, t *Table, outCols []*Column, ddlOnly bool,
 			// recovered rows.
 			onRow = dedupDeletedRows(onRow)
 		}
-		walkErr := WalkRows(sp, t, outCols, formatTSV, skipCorrupted, deletedOnly, onCorrupt, onRow)
+		walkErr := rw.Walk(onCorrupt, onRow)
 		pr.finish()
 		if ferr := dw.Finish(); ferr != nil && walkErr == nil {
 			walkErr = ferr
@@ -433,6 +433,23 @@ func (d *TSVDump) AddTable(sp *Space, t *Table, outCols []*Column, ddlOnly bool,
 		charset = charsetOf(cl.name)
 	} else if c, ok := uca1400Charset(t.CollationID); ok {
 		charset = c.name
+	}
+	// Every string field is written as its column's own raw stored bytes,
+	// in that column's own charset - so when some column's charset differs
+	// from the table's default (a latin1 column in a utf8mb3 table, say),
+	// no single text charset describes the whole file, and loading it as
+	// the table's own would reject or mangle the other columns' bytes
+	// ("Invalid utf8mb3 character string"). LOAD DATA ... CHARACTER SET
+	// binary instead stores every field's bytes into its column exactly as
+	// they are, which is precisely what they already are.
+	for _, c := range outCols {
+		if !columnHasCharset(c.DDType) || c.IsBinary() {
+			continue
+		}
+		if colCharset, _, _, ok := resolveCollation(c.CollationID); ok && colCharset != charset {
+			charset = "binary"
+			break
+		}
 	}
 
 	tm := tsvTableMeta{

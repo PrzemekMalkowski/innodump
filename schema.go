@@ -168,18 +168,65 @@ type ddIndexJSON struct {
 }
 
 type ddTableJSON struct {
-	Name          string             `json:"name"`
-	Hidden        uint32             `json:"hidden"`
-	Columns       []ddColumnJSON     `json:"columns"`
-	SchemaRef     string             `json:"schema_ref"`
-	SePrivateID   uint64             `json:"se_private_id"`
-	Comment       string             `json:"comment"`
-	SePrivateData string             `json:"se_private_data"`
-	RowFormat     uint32             `json:"row_format"`
-	PartitionType uint32             `json:"partition_type"`
-	CollationID   uint64             `json:"collation_id"`
-	Indexes       []ddIndexJSON      `json:"indexes"`
-	ForeignKeys   []ddForeignKeyJSON `json:"foreign_keys"`
+	Name          string         `json:"name"`
+	Hidden        uint32         `json:"hidden"`
+	Columns       []ddColumnJSON `json:"columns"`
+	SchemaRef     string         `json:"schema_ref"`
+	SePrivateID   uint64         `json:"se_private_id"`
+	Comment       string         `json:"comment"`
+	SePrivateData string         `json:"se_private_data"`
+	Engine        string         `json:"engine"`
+	RowFormat     uint32         `json:"row_format"`
+	PartitionType uint32         `json:"partition_type"`
+	// Partitioning (see partition.go) - only meaningful when PartitionType
+	// is non-zero; Table_impl::serialize in sql/dd/impl/types/table_impl.cc.
+	PartitionExpressionUtf8    string             `json:"partition_expression_utf8"`
+	DefaultPartitioning        uint32             `json:"default_partitioning"`
+	SubpartitionType           uint32             `json:"subpartition_type"`
+	SubpartitionExpressionUtf8 string             `json:"subpartition_expression_utf8"`
+	DefaultSubpartitioning     uint32             `json:"default_subpartitioning"`
+	Partitions                 []ddPartitionJSON  `json:"partitions"`
+	CollationID                uint64             `json:"collation_id"`
+	Indexes                    []ddIndexJSON      `json:"indexes"`
+	ForeignKeys                []ddForeignKeyJSON `json:"foreign_keys"`
+}
+
+// ddPartitionJSON is one partition (or, nested in Subpartitions, one
+// subpartition) of a partitioned table - Partition_impl::serialize in
+// sql/dd/impl/types/partition_impl.cc. Indexes holds this partition's own
+// copy of every table index (Partition_index_impl): the same index,
+// referenced by its position in the table's own "indexes" array, but with
+// this partition's own se_private_data - its own root page, index id and
+// tablespace (space_id), since every partition is a separate B+tree in a
+// separate file. A partition with subpartitions has no Indexes of its own;
+// each subpartition does.
+type ddPartitionJSON struct {
+	Name            string                 `json:"name"`
+	Number          uint32                 `json:"number"`
+	DescriptionUtf8 string                 `json:"description_utf8"`
+	Engine          string                 `json:"engine"`
+	Comment         string                 `json:"comment"`
+	SePrivateData   string                 `json:"se_private_data"`
+	Values          []ddPartitionValueJSON `json:"values"`
+	Indexes         []ddPartitionIndexJSON `json:"indexes"`
+	Subpartitions   []ddPartitionJSON      `json:"subpartitions"`
+}
+
+// ddPartitionValueJSON is one bound of a RANGE/LIST partition
+// (Partition_value_impl): ListNum groups the values of one LIST item,
+// ColumnNum orders a [RANGE|LIST] COLUMNS tuple's own values, and
+// ValueUtf8 is already SQL text (a string value comes with its quotes).
+type ddPartitionValueJSON struct {
+	MaxValue  bool   `json:"max_value"`
+	NullValue bool   `json:"null_value"`
+	ListNum   uint32 `json:"list_num"`
+	ColumnNum uint32 `json:"column_num"`
+	ValueUtf8 string `json:"value_utf8"`
+}
+
+type ddPartitionIndexJSON struct {
+	SePrivateData string `json:"se_private_data"`
+	IndexOpx      uint32 `json:"index_opx"`
 }
 
 // ddForeignKeyElementJSON is one column pair of a foreign key -
@@ -368,6 +415,7 @@ type ForeignKey struct {
 
 type Table struct {
 	Name, SchemaRef string
+	Engine          string // "InnoDB" or "MyISAM" - see BuildTable/BuildMyISAMTable
 	RowFormat       uint32
 	SePrivateID     uint64
 	Comment         string
@@ -377,10 +425,21 @@ type Table struct {
 	// Includes SE-hidden system columns; callers filter with Hidden/IsSystem.
 	Columns []*Column
 
-	HasExplicitPK  bool
-	PKFields       []*IndexField
-	PhysicalFields []*IndexField // full clustered-index row layout, in order
-	NNullable      int           // nullable count across PhysicalFields (plain/no-instant tables only)
+	HasExplicitPK bool
+	// PKIsUniqueKey is true when the clustered index isn't a declared
+	// PRIMARY KEY but the table's first UNIQUE key over NOT NULL, full-
+	// length columns, which InnoDB promotes to the clustered index when
+	// there's no PRIMARY KEY (see frmPromotedUniqueKey). The rows are laid
+	// out exactly as for a real PK (HasExplicitPK is true); only the DDL
+	// differs - it still says UNIQUE KEY, as SHOW CREATE TABLE does.
+	PKIsUniqueKey bool
+	// PartitionClause is a partitioned table's own PARTITION BY clause, as
+	// GenerateDDL appends it after the table options (see partition.go);
+	// "" for a table that isn't partitioned.
+	PartitionClause string
+	PKFields        []*IndexField
+	PhysicalFields  []*IndexField // full clustered-index row layout, in order
+	NNullable       int           // nullable count across PhysicalFields (plain/no-instant tables only)
 
 	// INSTANT ADD/DROP COLUMN (see instant.go). A table is in at most one of
 	// these two states (MySQL 8.0.29+ row-versioning supersedes the older
@@ -503,7 +562,9 @@ func packLength(c *ddColumnJSON) (uint32, error) {
 	case ddLonglong:
 		return 8, nil
 	case ddTimestamp:
-		return c.CharLength, nil
+		return 4, nil // pre-5.6.4 TIMESTAMP: whole seconds since the epoch
+	case ddDate:
+		return 4, nil // pre-5.0 DATE: YYYYMMDD as an integer
 	case ddTimestamp2:
 		return 4 + (c.DatetimePrecision+1)/2, nil
 	case ddYear:
@@ -697,7 +758,7 @@ func buildColumn(raw ddColumnJSON) (*Column, error) {
 // converted off REDUNDANT) that it's reported rather than decoded.
 func BuildTable(raw *ddTableJSON) (*Table, error) {
 	if raw.PartitionType != 0 {
-		return nil, fmt.Errorf("partitioned tables are not supported (v1 limitation)")
+		return nil, fmt.Errorf("this is a partitioned table - point --file at one of its own partition files (table#p#<partition>.ibd), or --source-dir at its directory, to extract it")
 	}
 	switch raw.RowFormat {
 	case rowFormatDynamic, rowFormatCompact, rowFormatRedundant, rowFormatCompressed:
@@ -718,9 +779,14 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 		colsByOpx[i] = c
 	}
 
+	engine := raw.Engine
+	if engine == "" {
+		engine = "InnoDB" // older SDI dumps predating this tool's Engine field
+	}
 	t := &Table{
 		Name:        raw.Name,
 		SchemaRef:   raw.SchemaRef,
+		Engine:      engine,
 		RowFormat:   raw.RowFormat,
 		SePrivateID: raw.SePrivateID,
 		Comment:     raw.Comment,
@@ -745,6 +811,7 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 	}
 	clust := raw.Indexes[0] // Index::FillSeIndex: ind==0 is always the clustered index
 	t.HasExplicitPK = !clust.Hidden
+	t.PKIsUniqueKey = !clust.Hidden && clust.Type == ddIndexUnique
 	t.IndexName = clust.Name
 	t.IndexID = 0
 	if p := sePropString(clust.SePrivateData); p["id"] != "" {
@@ -877,7 +944,9 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 			}
 			col := colsByOpx[el.ColumnOpx]
 			sic := SecondaryIndexColumn{Col: col, Desc: el.Order == ddOrderDesc}
-			if el.Length < col.ColLen {
+			// A BLOB/TEXT key part is always a prefix, however its length
+			// compares to the column's own (tiny) in-record pack length.
+			if el.Length < col.ColLen || (isBlobFamily(col.DDType) && el.Length > 0) {
 				sic.PrefixLen = el.Length
 			}
 			si.Columns = append(si.Columns, sic)

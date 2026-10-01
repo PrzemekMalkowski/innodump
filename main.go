@@ -61,7 +61,7 @@ const appName = "innodump"
 // The hardcoded fallback below is what a plain "go build"/"go install"
 // (no ldflags) prints instead - kept in sync with the latest tagged
 // release by hand.
-var version = "0.7.8"
+var version = "0.7.9"
 
 var (
 	filePath             = flag.String("file", "", "Path to the .ibd file to extract")
@@ -83,6 +83,7 @@ var (
 	showVersion          = flag.Bool("version", false, "Print version and exit")
 	dumpPage             = flag.Int("dump-page", -1, "debug: hex-dump one page and its record chain, then exit (requires --file)")
 	debug                = flag.Bool("debug", false, "debug: print each record's decoded field byte-ranges as they're read")
+	myisamToInnoDB       = flag.Bool("myisam-to-innodb", false, "Write every MyISAM table's DDL as ENGINE=InnoDB instead (adding a KEY for an AUTO_INCREMENT column InnoDB would otherwise reject), for migrating an old datadir's MyISAM tables to InnoDB on a new server - the row data itself is unchanged")
 )
 
 func main() {
@@ -99,7 +100,7 @@ func main() {
 		fmt.Printf("%s %s\n", appName, version)
 		fmt.Printf("Usage: %s --file /path/to/table.ibd [--out-dir DIR] [--table NAME] [--limit N]\n", appName)
 		fmt.Printf("       %s --source-dir /path/to/datadir [--out-dir DIR] [--limit N]\n", strings.Repeat(" ", len(appName)))
-		fmt.Println("       [--format sql|tsv] [--ddl-only] [--skip-corrupted] [--no-progress]")
+		fmt.Println("       [--format sql|tsv] [--ddl-only] [--myisam-to-innodb] [--skip-corrupted] [--no-progress]")
 		fmt.Println("       [--verbose] [--yes] [--debug] [--dump-page N] [--version]")
 		os.Exit(1)
 	}
@@ -157,6 +158,7 @@ func run() error {
 		return fmt.Errorf("--compression-level must be between 1 and 22, not %d", *compressLevel)
 	}
 	debugFields = *debug
+	convertMyISAMToInnoDB = *myisamToInnoDB
 	initProgress(*noProgress)
 
 	if *sourceDir != "" {
@@ -170,6 +172,12 @@ func run() error {
 			return fmt.Errorf("--dump-page requires --file, not --source-dir")
 		}
 		return runSourceDir()
+	}
+	if isMyISAMDataFile(*filePath) {
+		return runMyISAMFile()
+	}
+	if base, ok := partitionFileBase(*filePath); ok {
+		return runPartitionedFile(base)
 	}
 	return runSingleFile()
 }
@@ -260,6 +268,18 @@ func runSingleFile() error {
 		fmt.Printf("%s %s\n", dim("Physical fields:"), val(fmt.Sprintf("%d (%d output)", len(t.PhysicalFields), len(OutputColumns(t)))))
 	}
 
+	return writeSingleTable(t, *filePath, mysqlVersionID, "", func(outCols []*Column, format outputFormat) RowWalker {
+		return innodbRowWalker(sp, t, outCols, format, *skipCorrupted, *deletedOnly)
+	})
+}
+
+// writeSingleTable is --file's shared output half for an InnoDB table,
+// once t is built: the banner, then either one TSV dump directory or one
+// schema+data .sql pair. makeWalker builds the row source once the output
+// columns and format are known; partitions, if non-empty, is printed as a
+// "Partitions:" line (see runPartitionedFile).
+func writeSingleTable(t *Table, srcPath string, mysqlVersionID uint32, partitions string,
+	makeWalker func(outCols []*Column, format outputFormat) RowWalker) error {
 	outCols := OutputColumns(t)
 	if len(outCols) == 0 {
 		return fmt.Errorf("table %q has no columns this tool can output", t.Name)
@@ -267,6 +287,9 @@ func runSingleFile() error {
 
 	printBanner()
 	fmt.Printf("%s %s (row_format=%s)\n", dim("Table:      "), id(t.SchemaRef+"."+t.Name), rowFormatName(t.RowFormat))
+	if partitions != "" {
+		fmt.Printf("%s %s\n", dim("Partitions: "), partitions)
+	}
 	fmt.Printf("%s %d output (%d total incl. system/hidden)\n", dim("Columns:    "), len(outCols), len(t.Columns))
 
 	if *format == "tsv" {
@@ -282,7 +305,8 @@ func runSingleFile() error {
 		if err != nil {
 			return err
 		}
-		nOK, nErr, nCorruptPages, truncated, err := d.AddTable(sp, t, outCols, *ddlOnly, *limitRows, *skipCorrupted, *deletedOnly,
+		rw := makeWalker(outCols, formatTSV)
+		nOK, nErr, nCorruptPages, truncated, err := d.AddTable(rw, t, outCols, *ddlOnly, *limitRows, *skipCorrupted, *deletedOnly,
 			fmt.Sprintf("decoding %s.%s", t.SchemaRef, t.Name), mysqlVersionID, ck, *compressLevel)
 		if err != nil {
 			return err
@@ -325,7 +349,8 @@ func runSingleFile() error {
 		return err
 	}
 
-	nOK, nErr, nCorruptPages, truncated, err := writeSQLTable(sp, *filePath, schemaPath, dataPath, t, outCols,
+	rw := makeWalker(outCols, formatSQL)
+	nOK, nErr, nCorruptPages, truncated, err := writeSQLTable(rw, srcPath, schemaPath, dataPath, t, outCols,
 		*ddlOnly, *limitRows, *skipCorrupted, *deletedOnly)
 	if err != nil {
 		return err
@@ -352,6 +377,214 @@ func runSingleFile() error {
 	return nil
 }
 
+// runPartitionedFile is --file's path for one partition of a partitioned
+// InnoDB table ("t#p#p0.ibd"): a partition is never a table on its own,
+// so this extracts the whole table - every partition file found next to
+// the one given (see partition.go) - into one schema+data pair or TSV
+// table, exactly as --source-dir would.
+func runPartitionedFile(base string) error {
+	if *tableName != "" {
+		return fmt.Errorf("--table is not usable with a partition's file - every partition belongs to exactly one table, which is extracted as a whole")
+	}
+	if *dumpPage >= 0 {
+		sp, err := OpenSpace(*filePath)
+		if err != nil {
+			return err
+		}
+		defer sp.Close()
+		return debugDumpPage(sp, uint32(*dumpPage))
+	}
+	files, err := findPartitionFiles(base)
+	if err != nil {
+		return err
+	}
+	pt, err := resolvePartitionedTable(base, files)
+	if err != nil {
+		return err
+	}
+	op, err := openPartitionedTable(pt)
+	if err != nil {
+		return fmt.Errorf("table %q: %w", pt.Table, err)
+	}
+	defer op.Close()
+	warnPartitionGaps(pt, op, *filePath)
+	if *verbose {
+		for i, t := range op.Tables {
+			fmt.Printf("%s %s\n", dim("Partition:  "), val(fmt.Sprintf("%s - %s, space id %d, %d pages, clustered index id %d, root page %d",
+				op.Names[i], filepath.Base(op.Paths[i]), op.Spaces[i].SpaceID, op.Spaces[i].NumPages, t.IndexID, t.RootPage)))
+		}
+	}
+	return writeSingleTable(op.Main, *filePath, pt.MySQLVersionID, op.describe(), func(outCols []*Column, format outputFormat) RowWalker {
+		return op.rowWalker(format, *skipCorrupted, *deletedOnly)
+	})
+}
+
+// warnPartitionGaps warns (stderr) about partitions whose file is missing,
+// and partition files no partition of the table's own definition claims.
+func warnPartitionGaps(pt *partitionedTable, op *openPartitions, label string) {
+	for _, m := range op.Missing {
+		fmt.Fprintf(os.Stderr, "%s %s: table %s.%s: partition %s's tablespace file wasn't found - its rows are missing from this dump\n",
+			warn("warning:"), label, pt.Schema, pt.Table, m)
+	}
+	for _, f := range pt.Extra {
+		fmt.Fprintf(os.Stderr, "%s %s: %s isn't any partition of %s.%s's own definition - left out\n",
+			warn("warning:"), label, filepath.Base(f), pt.Schema, pt.Table)
+	}
+}
+
+// runMyISAMFile is --file's MyISAM path: --file points directly at a
+// table's .MYD (or .MYI - myisamDataPath resolves either to the .MYD data
+// itself always reads) rather than an InnoDB tablespace file - see
+// isMyISAMDataFile (main.go's run()) and myisam.go's own package comment.
+func runMyISAMFile() error {
+	if *tableName != "" {
+		return fmt.Errorf("--table is not usable with a MyISAM --file - a MyISAM data file always holds exactly one table")
+	}
+	if *dumpPage >= 0 {
+		return fmt.Errorf("--dump-page requires an InnoDB --file, not a MyISAM one")
+	}
+	if *deletedOnly {
+		return fmt.Errorf("--deleted-only is not supported for MyISAM tables yet (v1 limitation)")
+	}
+	mydPath := myisamDataPath(*filePath)
+
+	raw, mysqlVersionID, err := findMyISAMSchema(mydPath)
+	if err != nil {
+		return err
+	}
+	t, err := BuildMyISAMTable(raw)
+	if err != nil {
+		return fmt.Errorf("table %q: %w", raw.Name, err)
+	}
+	layout, err := buildMyISAMLayout(t)
+	if err != nil {
+		return fmt.Errorf("table %q: %w", t.Name, err)
+	}
+	if err := applyMYIHeader(mydPath, layout); err != nil {
+		return fmt.Errorf("table %q: %w", t.Name, err)
+	}
+	if *verbose {
+		printMyISAMInfo(mydPath, t, layout)
+	}
+
+	outCols := OutputColumns(t)
+	if len(outCols) == 0 {
+		return fmt.Errorf("table %q has no columns this tool can output", t.Name)
+	}
+
+	printBanner()
+	fmt.Printf("%s %s (engine=%s, row_format=%s)\n", dim("Table:      "), id(t.SchemaRef+"."+t.Name), t.Engine, rowFormatName(t.RowFormat))
+	if convertMyISAMToInnoDB {
+		note := ""
+		if k := myisamToInnoDBAutoIncKey(t); k != "" {
+			note = fmt.Sprintf(", with an extra KEY %s added for its AUTO_INCREMENT column - see the DDL header", backquote(k))
+		}
+		fmt.Printf("%s DDL written as ENGINE=InnoDB (--myisam-to-innodb)%s\n", dim("Converted:  "), note)
+	}
+	fmt.Printf("%s %d output (%d total incl. hidden)\n", dim("Columns:    "), len(outCols), len(t.Columns))
+
+	if *format == "tsv" {
+		ck, _ := parseCompressionKind(*compression) // already validated in run()
+		dir := *outDir
+		if dir == "" {
+			dir = defaultOutDir(*format)
+		}
+		if err := confirmOverwriteDir(dir, *yes || os.Getenv("YES") != ""); err != nil {
+			return err
+		}
+		d, err := NewTSVDump(dir)
+		if err != nil {
+			return err
+		}
+		rw := myisamRowWalker(mydPath, t, layout, outCols, formatTSV, *skipCorrupted)
+		nOK, nErr, nCorruptPages, truncated, err := d.AddTable(rw, t, outCols, *ddlOnly, *limitRows, *skipCorrupted, false,
+			fmt.Sprintf("decoding %s.%s", t.SchemaRef, t.Name), mysqlVersionID, ck, *compressLevel)
+		if err != nil {
+			return err
+		}
+		if err := d.Finish(); err != nil {
+			return err
+		}
+		compressNote := ""
+		if ck != compressionNone {
+			compressNote = fmt.Sprintf(", %s level %d", ck, *compressLevel)
+		}
+		fmt.Printf("%s %s (MySQL Shell util.loadDump()-compatible%s)\n", dim("Dump dir:   "), id(dir), compressNote)
+		if *ddlOnly {
+			return nil
+		}
+		printRowSummary(nOK, nErr, nCorruptPages, false)
+		if truncated {
+			printTruncatedNote()
+		}
+		return nil
+	}
+
+	// --format=sql (default)
+	base := outputBaseName(t.SchemaRef, t.Name)
+	dir := *outDir
+	if dir == "" {
+		dir = defaultOutDir(*format)
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("creating output directory %s: %w", dir, err)
+	}
+	schemaPath := filepath.Join(dir, base+"-schema.sql")
+	dataPath := filepath.Join(dir, sqlDataFilename(base, false))
+
+	wantPaths := []string{schemaPath}
+	if !*ddlOnly {
+		wantPaths = append(wantPaths, dataPath)
+	}
+	if err := confirmOverwrite(wantPaths, *yes || os.Getenv("YES") != ""); err != nil {
+		return err
+	}
+
+	rw := myisamRowWalker(mydPath, t, layout, outCols, formatSQL, *skipCorrupted)
+	nOK, nErr, nCorruptPages, truncated, err := writeSQLTable(rw, mydPath, schemaPath, dataPath, t, outCols,
+		*ddlOnly, *limitRows, *skipCorrupted, false)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("%s %s\n", dim("Schema file:"), id(schemaPath))
+	if *ddlOnly {
+		return nil
+	}
+	fmt.Printf("%s %s (%s row(s) written", dim("Data file:  "), id(dataPath), good(fmt.Sprintf("%d", nOK)))
+	if nErr > 0 {
+		fmt.Printf(", %s row(s) skipped - see warnings above", warn(fmt.Sprintf("%d", nErr)))
+	}
+	if nCorruptPages > 0 {
+		fmt.Printf(", %s corrupted record(s) skipped - see warnings above", bad(fmt.Sprintf("%d", nCorruptPages)))
+	}
+	fmt.Printf(")\n")
+	if truncated {
+		printTruncatedNote()
+	}
+	return nil
+}
+
+// printMyISAMInfo prints --verbose's extra detail for a MyISAM --file run -
+// the counterpart to printSpaceInfo's InnoDB tablespace detail.
+func printMyISAMInfo(path string, t *Table, lay *myisamLayout) {
+	fi, err := os.Stat(path)
+	size := int64(-1)
+	if err == nil {
+		size = fi.Size()
+	}
+	fmt.Printf("%s %s (%d bytes)\n", dim("File:       "), val(path), size)
+	fmt.Printf("%s %s\n", dim("Row format: "), val(rowFormatName(t.RowFormat)))
+	fmt.Printf("%s %s\n", dim("Null bytes: "), val(fmt.Sprintf("%d", lay.NullBytes)))
+	fmt.Printf("%s %s\n", dim("Unpacked record length:"), val(fmt.Sprintf("%d bytes", lay.RecLength)))
+	fmt.Printf("%s %s\n", dim("Physical fields:"), val(fmt.Sprintf("%d (%d output)", len(lay.Fields), len(OutputColumns(t)))))
+	fmt.Printf("%s %s\n", dim("Secondary indexes:"), val(fmt.Sprintf("%d", len(t.SecondaryIndexes))))
+	if lay.HaveMYI {
+		fmt.Printf("%s %s\n", dim(".MYI row count:"), val(fmt.Sprintf("%d (as of the table's last clean close)", lay.MYIRecords)))
+	} else {
+		fmt.Printf("%s %s\n", dim(".MYI header:"), val("not found or unreadable - record layout not cross-checked"))
+	}
+}
+
 // writeSQLTable writes t's schema+data .sql files (schemaPath/dataPath),
 // exactly as the original (pre-multi-file) single-table SQL path always
 // has - shared by runSingleFile and runSourceDir's --format=sql branch.
@@ -360,7 +593,7 @@ func runSingleFile() error {
 // truncatedReason) - the caller should make sure that's not lost in the
 // generic nCorruptPages count, since it means specifically that the file
 // wasn't fully copied, not that one page among many good ones was bad.
-func writeSQLTable(sp *Space, srcPath, schemaPath, dataPath string, t *Table, outCols []*Column,
+func writeSQLTable(rw RowWalker, srcPath, schemaPath, dataPath string, t *Table, outCols []*Column,
 	ddlOnly bool, limitRows int, skipCorrupted, deletedOnly bool) (nOK, nErr, nCorruptPages int, truncated bool, err error) {
 	if !ddlOnly {
 		autoIncIdx := -1
@@ -389,7 +622,7 @@ func writeSQLTable(sp *Space, srcPath, schemaPath, dataPath string, t *Table, ou
 		// a big tablespace, and rarely (page splits/allocation order) the
 		// leaf chain can visit a lower page number after a higher one. Either
 		// way it still gives a fair sense of progress on a large extraction.
-		pr := newProg(fmt.Sprintf("decoding %s.%s", t.SchemaRef, t.Name), int64(sp.NumPages))
+		pr := newProg(fmt.Sprintf("decoding %s.%s", t.SchemaRef, t.Name), rw.ProgressTotal)
 		defer pr.finish()
 		onCorrupt := func(cp CorruptPage) {
 			nCorruptPages++
@@ -399,16 +632,16 @@ func writeSQLTable(sp *Space, srcPath, schemaPath, dataPath string, t *Table, ou
 			// pr.Warnf (not a plain Fprintf) clears the bar's own
 			// in-progress line first, so this can't land mid-redraw and
 			// splice into it - see progress.go.
-			pr.Warnf("%s corrupted page %d (index %q, id %d): %s\n", warn("warning:"), cp.PageNo, t.IndexName, t.IndexID, cp.Reason)
-			fmt.Fprintf(bw, "-- skipped corrupted page %d (table %s.%s, index %q, id %d): %s\n",
-				cp.PageNo, t.SchemaRef, t.Name, t.IndexName, t.IndexID, cp.Reason)
+			pr.Warnf("%s corrupted %s: %s\n", warn("warning:"), t.corruptUnitLabel(cp.PageNo), cp.Reason)
+			fmt.Fprintf(bw, "-- skipped corrupted %s (table %s.%s): %s\n",
+				t.corruptUnitLabel(cp.PageNo), t.SchemaRef, t.Name, cp.Reason)
 		}
 		onRow := func(roe RowOrError) bool {
-			pr.set(int64(roe.PageNo))
+			pr.set(roe.ProgressBase + int64(roe.PageNo))
 			if roe.Err != nil {
 				nErr++
-				pr.Warnf("%s page %d rec@0x%x: %v\n", warn("warning:"), roe.PageNo, roe.RecOff, roe.Err)
-				fmt.Fprintf(bw, "-- skipped a row at page %d rec@0x%x: %v\n", roe.PageNo, roe.RecOff, roe.Err)
+				pr.Warnf("%s %s: %v\n", warn("warning:"), t.corruptRowLabel(roe.PageNo, roe.RecOff), roe.Err)
+				fmt.Fprintf(bw, "-- skipped a row at %s: %v\n", t.corruptRowLabel(roe.PageNo, roe.RecOff), roe.Err)
 				return limitRows == 0 || nOK+nErr < limitRows
 			}
 			fmt.Fprintf(bw, "%s%s;\n", prefix, FormatRow(roe.Row))
@@ -428,7 +661,7 @@ func writeSQLTable(sp *Space, srcPath, schemaPath, dataPath string, t *Table, ou
 			// recovered rows.
 			onRow = dedupDeletedRows(onRow)
 		}
-		walkErr := WalkRows(sp, t, outCols, formatSQL, skipCorrupted, deletedOnly, onCorrupt, onRow)
+		walkErr := rw.Walk(onCorrupt, onRow)
 		pr.finish()
 		if ferr := bw.Flush(); ferr != nil && walkErr == nil {
 			walkErr = ferr
@@ -495,9 +728,9 @@ func runSourceDir() error {
 
 	printBanner()
 	if safe {
-		fmt.Printf("Following %s recursively — recognized as %s, so every InnoDB table found inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) will be dumped.\n", id(*sourceDir), kind)
+		fmt.Printf("Following %s recursively — recognized as %s, so every InnoDB table found inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) and every MyISAM table (.MYD files) will be dumped.\n", id(*sourceDir), kind)
 	} else {
-		fmt.Printf("Following %s recursively (--force-scan) — every InnoDB table found anywhere inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) will be dumped.\n", id(*sourceDir))
+		fmt.Printf("Following %s recursively (--force-scan) — every InnoDB table found anywhere inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) and every MyISAM table (.MYD files) will be dumped.\n", id(*sourceDir))
 	}
 
 	dir := *outDir
@@ -524,7 +757,7 @@ func runSourceDir() error {
 	// shared-tablespace resolution - see the package comment on
 	// sysdict.go for why this is only ever needed for a pre-8.0/MariaDB
 	// tablespace (innodb_file_per_table=0), never a modern SDI-based one.
-	var ibdFiles, frmFiles []string
+	var ibdFiles, frmFiles, mydFiles []string
 	walkErr := filepath.WalkDir(*sourceDir, func(path string, ent fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -537,6 +770,8 @@ func runSourceDir() error {
 			ibdFiles = append(ibdFiles, path)
 		case ".frm":
 			frmFiles = append(frmFiles, path)
+		case ".myd":
+			mydFiles = append(mydFiles, path)
 		}
 		return nil
 	})
@@ -545,29 +780,63 @@ func runSourceDir() error {
 	}
 	sort.Strings(ibdFiles)
 	sort.Strings(frmFiles)
+	sort.Strings(mydFiles)
+
+	// A partitioned table's partitions are separate .ibd files, but one
+	// table: group them by the table they belong to (partition.go) and
+	// extract each group once, rather than each file on its own.
+	partGroups := map[string][]string{}
+	var partBases []string
+	nPartFiles := 0
+	{
+		var plain []string
+		for _, p := range ibdFiles {
+			if base, ok := partitionFileBase(p); ok {
+				if partGroups[base] == nil {
+					partBases = append(partBases, base)
+				}
+				partGroups[base] = append(partGroups[base], p)
+				nPartFiles++
+				continue
+			}
+			plain = append(plain, p)
+		}
+		ibdFiles = plain
+	}
 
 	// A .frm with a same-named .ibd right beside it is an ordinary
 	// file-per-table table, already covered by the ibdFiles loop below
-	// (loadTargets/findLegacyFRM) - only a .frm left with no .ibd of its
-	// own might be a shared-tablespace table worth resolving via ibdata1.
-	ibdBases := make(map[string]bool, len(ibdFiles))
-	for _, p := range ibdFiles {
-		ibdBases[strings.TrimSuffix(p, filepath.Ext(p))] = true
+	// (loadTargets/findLegacyFRM), and one with a same-named .MYD is a
+	// pre-8.0 MyISAM table, covered by the mydFiles loop (findMyISAMSchema)
+	// - only a .frm left with neither might be a shared-tablespace table
+	// worth resolving via ibdata1.
+	coveredBases := make(map[string]bool, len(ibdFiles)+len(mydFiles)+len(partBases))
+	for _, p := range append(append([]string(nil), ibdFiles...), mydFiles...) {
+		coveredBases[strings.TrimSuffix(p, filepath.Ext(p))] = true
+	}
+	for _, base := range partBases { // a partitioned table's own .frm
+		coveredBases[base] = true
 	}
 	var sharedFRMs []string
 	for _, p := range frmFiles {
-		if !ibdBases[strings.TrimSuffix(p, filepath.Ext(p))] {
+		if !coveredBases[strings.TrimSuffix(p, filepath.Ext(p))] {
 			sharedFRMs = append(sharedFRMs, p)
 		}
 	}
 
-	if len(ibdFiles) == 0 && len(sharedFRMs) == 0 {
-		return fmt.Errorf("no .ibd or .frm files found under %s", *sourceDir)
+	if len(ibdFiles) == 0 && len(sharedFRMs) == 0 && len(mydFiles) == 0 && len(partBases) == 0 {
+		return fmt.Errorf("no .ibd, .frm, or .MYD files found under %s", *sourceDir)
 	}
 
-	srcMsg := fmt.Sprintf("%d .ibd file(s)", len(ibdFiles))
+	srcMsg := fmt.Sprintf("%d .ibd file(s)", len(ibdFiles)+nPartFiles)
+	if len(partBases) > 0 {
+		srcMsg += fmt.Sprintf(" - %d of them partitions of %d partitioned table(s)", nPartFiles, len(partBases))
+	}
 	if len(sharedFRMs) > 0 {
 		srcMsg += fmt.Sprintf(", %d .frm-only table(s) to resolve via ibdata1", len(sharedFRMs))
+	}
+	if len(mydFiles) > 0 {
+		srcMsg += fmt.Sprintf(", %d MyISAM .MYD file(s)", len(mydFiles))
 	}
 	fmt.Printf("%s %s (%s found)\n", dim("Source:     "), id(*sourceDir), srcMsg)
 
@@ -586,6 +855,46 @@ func runSourceDir() error {
 			continue
 		}
 		nFilesOK++
+	}
+
+	for _, base := range partBases {
+		files := partGroups[base]
+		nt, nr, nre, nc, ntr, ns, err := extractPartitionedTable(base, files, dir, d)
+		nTables += nt
+		nRowsTotal += nr
+		nRowErrTotal += nre
+		nCorruptTotal += nc
+		nTruncatedTotal += ntr
+		nSkippedTotal += ns
+		if err != nil {
+			nFileErrs += len(files)
+			fmt.Fprintf(os.Stderr, "%s %s (partitioned table, %d partition file(s)): %v\n", warn("warning:"), base, len(files), err)
+			continue
+		}
+		nFilesOK += len(files)
+	}
+
+	var nMydOK, nMydErrs, nConverted, nConvertedKeys int
+	for _, path := range mydFiles {
+		nt, nr, nre, nc, ntr, ns, err := extractMyISAMFileTable(path, dir, d)
+		if nt > 0 && convertMyISAMToInnoDB {
+			nConverted++
+			if myisamConvertAddsKey(path) {
+				nConvertedKeys++
+			}
+		}
+		nTables += nt
+		nRowsTotal += nr
+		nRowErrTotal += nre
+		nCorruptTotal += nc
+		nTruncatedTotal += ntr
+		nSkippedTotal += ns
+		if err != nil {
+			nMydErrs++
+			fmt.Fprintf(os.Stderr, "%s %s: %v\n", warn("warning:"), path, err)
+			continue
+		}
+		nMydOK++
 	}
 
 	if len(sharedFRMs) > 0 {
@@ -620,14 +929,28 @@ func runSourceDir() error {
 		}
 	}
 
-	if len(ibdFiles) > 0 {
-		fmt.Printf("%s %s/%d processed", dim("Files:      "), good(fmt.Sprintf("%d", nFilesOK)), len(ibdFiles))
+	if len(ibdFiles)+nPartFiles > 0 {
+		fmt.Printf("%s %s/%d .ibd file(s) processed", dim("Files:      "), good(fmt.Sprintf("%d", nFilesOK)), len(ibdFiles)+nPartFiles)
 		if nFileErrs > 0 {
 			fmt.Printf(" (%s failed - see warnings above)", bad(fmt.Sprintf("%d", nFileErrs)))
 		}
 		fmt.Println()
 	}
+	if len(mydFiles) > 0 {
+		fmt.Printf("%s %s/%d MyISAM .MYD file(s) processed", dim("Files:      "), good(fmt.Sprintf("%d", nMydOK)), len(mydFiles))
+		if nMydErrs > 0 {
+			fmt.Printf(" (%s failed - see warnings above)", bad(fmt.Sprintf("%d", nMydErrs)))
+		}
+		fmt.Println()
+	}
 	fmt.Printf("%s %d extracted\n", dim("Tables:     "), nTables)
+	if convertMyISAMToInnoDB && len(mydFiles) > 0 {
+		fmt.Printf("%s %s MyISAM table(s) written as ENGINE=InnoDB (--myisam-to-innodb)", dim("Converted:  "), good(fmt.Sprintf("%d", nConverted)))
+		if nConvertedKeys > 0 {
+			fmt.Printf(", %d of them with an extra KEY added for their AUTO_INCREMENT column - see each one's DDL header", nConvertedKeys)
+		}
+		fmt.Println()
+	}
 	if nSkippedTotal > 0 {
 		fmt.Printf("%s %d system-schema table(s) skipped (mysql/sys/performance_schema/information_schema/ndbinfo) - pass %s to include them\n",
 			dim("Skipped:    "), nSkippedTotal, id("--include-system-schemas"))
@@ -648,8 +971,15 @@ func runSourceDir() error {
 		fmt.Printf("%s %d source file%s looked truncated (not fully copied) - recovered every row up to where each one ends; anything stored after that point is missing.\n",
 			warn("Note:       "), nTruncatedTotal, plural)
 	}
-	if nFileErrs > 0 {
-		return fmt.Errorf("%d of %d .ibd file(s) failed - see warnings above", nFileErrs, len(ibdFiles))
+	if nFileErrs > 0 || nMydErrs > 0 {
+		var parts []string
+		if nFileErrs > 0 {
+			parts = append(parts, fmt.Sprintf("%d of %d .ibd file(s)", nFileErrs, len(ibdFiles)+nPartFiles))
+		}
+		if nMydErrs > 0 {
+			parts = append(parts, fmt.Sprintf("%d of %d MyISAM .MYD file(s)", nMydErrs, len(mydFiles)))
+		}
+		return fmt.Errorf("%s failed - see warnings above", strings.Join(parts, ", "))
 	}
 	return nil
 }
@@ -727,6 +1057,78 @@ func extractFileTables(path, dir string, tsvDump *TSVDump) (nTables, nOK, nErr, 
 	return nTables, nOK, nErr, nCorruptPages, nTruncated, nSkipped, nil
 }
 
+// extractMyISAMFileTable extracts the single table one .MYD file found
+// under --source-dir describes - the MyISAM counterpart to extractFileTables.
+// Unlike a .ibd (whose SDI can hold more than one table in a shared
+// tablespace), a MyISAM data file always holds exactly one, so there's no
+// per-file loop over multiple targets here.
+func extractMyISAMFileTable(mydPath, dir string, tsvDump *TSVDump) (nTables, nOK, nErr, nCorruptPages, nTruncated, nSkipped int, err error) {
+	raw, mysqlVersionID, err := findMyISAMSchema(mydPath)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, err
+	}
+	// Same "leave system schemas out of a whole-instance --format=tsv scan
+	// by default" rule processTable applies for InnoDB - see isSystemSchema.
+	if tsvDump != nil && !*includeSystemSchemas && isSystemSchema(raw.SchemaRef) {
+		return 0, 0, 0, 0, 0, 1, nil
+	}
+	t, err := BuildMyISAMTable(raw)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("table %q: %w", raw.Name, err)
+	}
+	layout, err := buildMyISAMLayout(t)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("table %q: %w", t.Name, err)
+	}
+	if err := applyMYIHeader(mydPath, layout); err != nil {
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("table %q: %w", t.Name, err)
+	}
+	ok, tOK, tErr, tCorrupt, tTruncated := writeAndSummarizeTable(t, mydPath, dir, mysqlVersionID, tsvDump,
+		func(outCols []*Column, format outputFormat) RowWalker {
+			return myisamRowWalker(mydPath, t, layout, outCols, format, *skipCorrupted)
+		})
+	if !ok {
+		return 0, 0, 0, 0, 0, 0, nil // already warned by writeAndSummarizeTable
+	}
+	nt := 0
+	if tTruncated {
+		nt = 1
+	}
+	return 1, tOK, tErr, tCorrupt, nt, 0, nil
+}
+
+// extractPartitionedTable extracts one partitioned InnoDB table found under
+// --source-dir - every one of its partition files (files, all sharing
+// base; see partition.go) - as a single table, the partitioned-table
+// counterpart to extractFileTables.
+func extractPartitionedTable(base string, files []string, dir string, tsvDump *TSVDump) (nTables, nOK, nErr, nCorruptPages, nTruncated, nSkipped int, err error) {
+	pt, err := resolvePartitionedTable(base, files)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, err
+	}
+	if tsvDump != nil && !*includeSystemSchemas && isSystemSchema(pt.Schema) {
+		return 0, 0, 0, 0, 0, 1, nil
+	}
+	op, err := openPartitionedTable(pt)
+	if err != nil {
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("table %q: %w", pt.Table, err)
+	}
+	defer op.Close()
+	warnPartitionGaps(pt, op, base)
+	ok, tOK, tErr, tCorrupt, tTruncated := writeAndSummarizeTable(op.Main, files[0], dir, pt.MySQLVersionID, tsvDump,
+		func(outCols []*Column, format outputFormat) RowWalker {
+			return op.rowWalker(format, *skipCorrupted, *deletedOnly)
+		})
+	if !ok {
+		return 0, 0, 0, 0, 0, 0, fmt.Errorf("table %q wasn't written - see the warning above", pt.Table)
+	}
+	nt := 0
+	if tTruncated {
+		nt = 1
+	}
+	return 1, tOK, tErr, tCorrupt, nt, 0, nil
+}
+
 // processTable builds, decodes, and writes one already-resolved table
 // target - the shared per-table work behind both extractFileTables' SDI/
 // .frm targets and extractSharedFRMTables' shared-tablespace ones. srcLabel
@@ -753,18 +1155,37 @@ func processTable(sp *Space, srcLabel, dir string, target *ddTableJSON, mysqlVer
 		fmt.Fprintf(os.Stderr, "%s %s: table %q: %v\n", warn("warning:"), srcLabel, target.Name, berr)
 		return false, 0, 0, 0, false, false
 	}
+	ok, tOK, tErr, tCorrupt, tTruncated = writeAndSummarizeTable(t, srcLabel, dir, mysqlVersionID, tsvDump,
+		func(outCols []*Column, format outputFormat) RowWalker {
+			return innodbRowWalker(sp, t, outCols, format, *skipCorrupted, *deletedOnly)
+		})
+	return ok, tOK, tErr, tCorrupt, tTruncated, false
+}
+
+// writeAndSummarizeTable is the shared "decode+write the table, then print
+// one summary line" tail both engines' --source-dir table processing goes
+// through once each has built its own *Table (processTable for InnoDB via
+// BuildTable, processMyISAMTable for MyISAM via BuildMyISAMTable) -
+// everything past that point (picking --format=sql vs tsv, writing the
+// files, and the "  schema.table: N row(s)..." summary line) is identical
+// either way. makeWalker builds the engine-specific RowWalker once outCols
+// and the target format (sql vs tsv) are known.
+func writeAndSummarizeTable(t *Table, srcLabel, dir string, mysqlVersionID uint32, tsvDump *TSVDump,
+	makeWalker func(outCols []*Column, format outputFormat) RowWalker) (ok bool, tOK, tErr, tCorrupt int, tTruncated bool) {
 	outCols := OutputColumns(t)
 	if len(outCols) == 0 {
 		fmt.Fprintf(os.Stderr, "%s %s: table %q has no columns this tool can output\n", warn("warning:"), srcLabel, t.Name)
-		return false, 0, 0, 0, false, false
+		return false, 0, 0, 0, false
 	}
 
 	label := fmt.Sprintf("decoding %s.%s", t.SchemaRef, t.Name)
 	var err error
 	if tsvDump != nil {
+		rw := makeWalker(outCols, formatTSV)
 		ck, _ := parseCompressionKind(*compression) // already validated in run()
-		tOK, tErr, tCorrupt, tTruncated, err = tsvDump.AddTable(sp, t, outCols, *ddlOnly, *limitRows, *skipCorrupted, *deletedOnly, label, mysqlVersionID, ck, *compressLevel)
+		tOK, tErr, tCorrupt, tTruncated, err = tsvDump.AddTable(rw, t, outCols, *ddlOnly, *limitRows, *skipCorrupted, *deletedOnly, label, mysqlVersionID, ck, *compressLevel)
 	} else {
+		rw := makeWalker(outCols, formatSQL)
 		base := outputBaseName(t.SchemaRef, t.Name)
 		schemaPath := filepath.Join(dir, base+"-schema.sql")
 		dataPath := filepath.Join(dir, sqlDataFilename(base, *deletedOnly))
@@ -774,14 +1195,14 @@ func processTable(sp *Space, srcLabel, dir string, target *ddTableJSON, mysqlVer
 		}
 		if err = confirmOverwrite(wantPaths, *yes || os.Getenv("YES") != ""); err != nil {
 			fmt.Fprintf(os.Stderr, "%s %s: table %q: %v\n", warn("warning:"), srcLabel, t.Name, err)
-			return false, 0, 0, 0, false, false
+			return false, 0, 0, 0, false
 		}
-		tOK, tErr, tCorrupt, tTruncated, err = writeSQLTable(sp, srcLabel, schemaPath, dataPath, t, outCols,
+		tOK, tErr, tCorrupt, tTruncated, err = writeSQLTable(rw, srcLabel, schemaPath, dataPath, t, outCols,
 			*ddlOnly, *limitRows, *skipCorrupted, *deletedOnly)
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s %s: table %q: %v\n", warn("warning:"), srcLabel, t.Name, err)
-		return false, 0, 0, 0, false, false
+		return false, 0, 0, 0, false
 	}
 	fmt.Printf("  %s: ", id(t.SchemaRef+"."+t.Name))
 	if *ddlOnly {
@@ -803,7 +1224,7 @@ func processTable(sp *Space, srcLabel, dir string, target *ddTableJSON, mysqlVer
 		}
 		fmt.Println()
 	}
-	return true, tOK, tErr, tCorrupt, tTruncated, false
+	return true, tOK, tErr, tCorrupt, tTruncated
 }
 
 // extractSharedFRMTables resolves and extracts every .frm file in frmPaths

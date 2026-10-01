@@ -122,14 +122,8 @@ func nonLeafChildPage(page []byte, recOff uint32, t *Table, compact bool) (uint3
 
 	var ranges []fieldRange
 	if compact {
-		nNull := 0
-		for _, f := range keyFields {
-			if f.Col.IsNullable {
-				nNull++
-			}
-		}
 		var err error
-		ranges, err = decodeFieldRanges(page, recOff, fields, nNull)
+		ranges, err = decodeFieldRanges(page, recOff, fields, nodePtrNNullable(t))
 		if err != nil {
 			return 0, err
 		}
@@ -141,6 +135,39 @@ func nonLeafChildPage(page []byte, recOff uint32, t *Table, compact bool) (uint3
 		return 0, fmt.Errorf("corrupt node-pointer record")
 	}
 	return binary.BigEndian.Uint32(page[last.Start:last.End]), nil
+}
+
+// nodePtrNNullable is the nullable-column count a COMPACT node-pointer
+// record's NULL bitmap is sized off: the *whole clustered index's*, not
+// just its own key columns' (which, being PRIMARY KEY columns, never are
+// nullable) - InnoDB parses node-pointer and leaf records through the same
+// rec_init_null_and_len_comp with the same dict_index_t, so the bitmap
+// reserves a bit for every nullable column in the table even though a
+// node pointer never uses them (see zipIndexShape.fields for the
+// compressed-page counterpart). A node pointer never carries the instant
+// or row-version header flags, so on a table with INSTANT ADD/DROP COLUMN
+// history this is the pre-first-instant count - the same one decodeRecord
+// Fields uses for an unflagged leaf record. Getting this wrong on a table
+// with any nullable column reads the key's own bytes as its length and
+// its first 4 bytes as the child page number.
+func nodePtrNNullable(t *Table) int {
+	switch {
+	case t.HasRowVersions:
+		return t.NullableInVersion[0]
+	case t.HasOldInstantCols:
+		n := 0
+		for i, f := range t.PhysicalFields {
+			if i >= t.OldNonDefaultFields {
+				break
+			}
+			if f.Col.IsNullable {
+				n++
+			}
+		}
+		return n
+	default:
+		return t.NNullable
+	}
 }
 
 // Row is one decoded record: the SQL literal for every output column, in
@@ -155,13 +182,41 @@ type RowOrError struct {
 	PageNo, RecOff uint32
 	Row            *Row
 	Err            error
+	// ProgressBase offsets PageNo for the progress bar only, when one walk
+	// spans several files one after another (a partitioned table - see
+	// partition.go's rowWalker): the pages of every file walked before this
+	// one. Always 0 for a single file.
+	ProgressBase int64
 }
 
-// CorruptPage describes one leaf page that failed validation.
+// CorruptPage describes one leaf page (InnoDB) or one damaged record
+// (MyISAM - see myisam.go) that failed validation.
 type CorruptPage struct {
 	PageNo    uint32
 	Reason    string
 	Truncated bool // pageNo is past the end of the file itself - see collectBatch
+}
+
+// corruptUnitLabel names the physical unit --skip-corrupted skips past, for
+// the shared warning/comment text writeSQLTable (main.go) and
+// TSVDump.AddTable (tsvdump.go) print for either engine: an InnoDB leaf
+// "page N (index "IDX", id I)", or a MyISAM "record near data-file offset
+// N" (there being no page/index concept in a MyISAM data file - see
+// WalkMyISAMRows, which reuses PageNo to carry a byte offset instead).
+func (t *Table) corruptUnitLabel(pageNo uint32) string {
+	if t.Engine == "MyISAM" {
+		return fmt.Sprintf("record near data-file offset %d", pageNo)
+	}
+	return fmt.Sprintf("page %d (index %q, id %d)", pageNo, t.IndexName, t.IndexID)
+}
+
+// corruptRowLabel is corruptUnitLabel's counterpart for a single row that
+// failed to decode (as opposed to a whole page/block failing validation).
+func (t *Table) corruptRowLabel(pageNo, recOff uint32) string {
+	if t.Engine == "MyISAM" {
+		return fmt.Sprintf("offset %d", pageNo)
+	}
+	return fmt.Sprintf("page %d rec@0x%x", pageNo, recOff)
 }
 
 // dedupDeletedRows wraps fn so that a row whose full set of output values
@@ -194,6 +249,30 @@ func dedupDeletedRows(fn func(RowOrError) bool) func(RowOrError) bool {
 		}
 		seen[key] = true
 		return fn(roe)
+	}
+}
+
+// RowWalker abstracts the engine-specific "decode every row and hand it to
+// a callback" step behind one closure, so the shared writing code
+// (writeSQLTable in main.go, TSVDump.AddTable in tsvdump.go) never needs to
+// know whether it's reading an InnoDB clustered index (WalkRows, below) or
+// a MyISAM data file (WalkMyISAMRows, myisam.go) - both engines' row
+// producers are wrapped into one of these (see innodbRowWalker/
+// myisamRowWalker) before being handed to that shared code.
+type RowWalker struct {
+	// ProgressTotal sizes the progress bar: an InnoDB walk uses the
+	// tablespace's own page count, a MyISAM one its data file's byte size.
+	ProgressTotal int64
+	Walk          func(onCorrupt func(CorruptPage), fn func(RowOrError) bool) error
+}
+
+// innodbRowWalker adapts WalkRows into a RowWalker.
+func innodbRowWalker(sp *Space, t *Table, outCols []*Column, format outputFormat, skipCorrupted, deletedOnly bool) RowWalker {
+	return RowWalker{
+		ProgressTotal: int64(sp.NumPages),
+		Walk: func(onCorrupt func(CorruptPage), fn func(RowOrError) bool) error {
+			return WalkRows(sp, t, outCols, format, skipCorrupted, deletedOnly, onCorrupt, fn)
+		},
 	}
 }
 
