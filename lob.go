@@ -31,6 +31,11 @@ import (
 // fetchExternal fetches an externally-stored column's value, detecting
 // which off-page format it uses from its first page's own FIL_PAGE_TYPE.
 func fetchExternal(sp *Space, ref externalRef) ([]byte, error) {
+	if ref.PageNo == 0xFFFFFFFF {
+		// FIL_NULL: purge already freed the value (a deleted row's, seen
+		// by --deleted-only) - or the reference itself is damaged.
+		return nil, fmt.Errorf("its off-page value is gone: the reference points nowhere (FIL_NULL), as purge leaves a deleted row's freed BLOB")
+	}
 	first, err := sp.ReadPage(ref.PageNo)
 	if err != nil {
 		return nil, err

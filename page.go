@@ -19,9 +19,11 @@ package main
 
 import (
 	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"os"
 )
 
@@ -285,7 +287,75 @@ func (s *Space) ReadPage(pageNo uint32) ([]byte, error) {
 	if err != nil && n != len(buf) {
 		return nil, fmt.Errorf("reading page %d: %w", pageNo, err)
 	}
+	if !s.Compressed && filType(buf) == filPageTypeCompressed {
+		// Transparent page compression: restore the page, as the server's
+		// own I/O layer does before anything else looks at it. One that
+		// won't decompress is handed back as-is, for checkPage to report.
+		if page, err := decompressTransparentPage(buf); err == nil {
+			return page, nil
+		}
+	}
 	return buf, nil
+}
+
+// Transparent page compression (CREATE/ALTER TABLE ... COMPRESSION='zlib'
+// or 'lz4', MySQL 5.7+): a page is written as its unchanged 38-byte FIL
+// header, with FIL_PAGE_TYPE set to FIL_PAGE_COMPRESSED and the
+// (otherwise unused) FIL_PAGE_FILE_FLUSH_LSN bytes reused for a small
+// descriptor, followed by the compressed rest of the page; the tail of the
+// page is a punched hole. See Compression::serialize/deserialize in
+// mysql-server (storage/innobase/os/os0file.cc, file.cc).
+const (
+	filPageTypeCompressed = 14
+	tpcVersionOff         = 26 // 1 or 2
+	tpcAlgorithmOff       = 27 // 1 zlib, 2 LZ4
+	tpcOriginalTypeOff    = 28
+	tpcOriginalSizeOff    = 30 // bytes after the FIL header, uncompressed
+	tpcCompressedSizeOff  = 32
+)
+
+// decompressTransparentPage restores one FIL_PAGE_COMPRESSED page:
+// decompressed data back at FIL_PAGE_DATA, original page type restored
+// (Compression::deserialize). The page checksum is then verified on the
+// result, as the server does.
+func decompressTransparentPage(raw []byte) ([]byte, error) {
+	version := raw[tpcVersionOff]
+	if version != 1 && version != 2 {
+		return nil, fmt.Errorf("unknown page compression format version %d", version)
+	}
+	origSize := int(binary.BigEndian.Uint16(raw[tpcOriginalSizeOff:]))
+	compSize := int(binary.BigEndian.Uint16(raw[tpcCompressedSizeOff:]))
+	if filPageData+origSize > len(raw) || filPageData+compSize > len(raw) {
+		return nil, fmt.Errorf("page compression sizes (%d compressed, %d original) don't fit the page", compSize, origSize)
+	}
+	src := raw[filPageData : filPageData+compSize]
+	var data []byte
+	switch alg := raw[tpcAlgorithmOff]; alg {
+	case 1: // zlib (zlib-wrapped deflate: uncompress())
+		zr, err := zlib.NewReader(bytes.NewReader(src))
+		if err != nil {
+			return nil, fmt.Errorf("zlib page compression: %w", err)
+		}
+		data, err = io.ReadAll(io.LimitReader(zr, int64(origSize)+1))
+		if err != nil {
+			return nil, fmt.Errorf("zlib page compression: %w", err)
+		}
+	case 2: // LZ4 (a raw block)
+		var err error
+		if data, _, err = lz4DecodeBlock(src, origSize, nil); err != nil {
+			return nil, fmt.Errorf("LZ4 page compression: %w", err)
+		}
+	default:
+		return nil, fmt.Errorf("unknown page compression algorithm %d", alg)
+	}
+	if len(data) > len(raw)-filPageData {
+		return nil, fmt.Errorf("page decompressed to %d bytes, more than a page holds", len(data))
+	}
+	page := make([]byte, len(raw))
+	copy(page, raw[:filPageData])
+	copy(page[filPageData:], data)
+	copy(page[filPageType:], raw[tpcOriginalTypeOff:tpcOriginalTypeOff+2])
+	return page, nil
 }
 
 // Decompress turns a page's raw physical bytes (as returned by ReadPage)
@@ -364,8 +434,8 @@ func (s *Space) ReadIndexPage(pageNo uint32, shape zipIndexShape) ([]byte, error
 //     verified byte-for-byte against a real Percona Server 5.6.47 page
 //     before trusting it.
 //
-// Not implemented: page-compressed (zlib) checksums, out of scope anyway
-// (v1 rejects compressed tablespaces in OpenSpace).
+// A page-compressed (COMPRESSION='zlib'/'lz4') page is checked after
+// ReadPage has restored it, as the server checks it after decompressing.
 const bufNoChecksumMagic = 0xDEADBEEF
 
 // ut0rnd.ic's UT_HASH_RANDOM_MASK/UT_HASH_RANDOM_MASK2 - fixed constants
@@ -473,6 +543,11 @@ func checkPage(page []byte, compressed, fullCRC32 bool) pageCheck {
 			return pageCheck{OK: true, Empty: true}
 		}
 		return pageCheck{OK: true}
+	}
+	if filType(page) == filPageTypeCompressed {
+		// ReadPage restores every page it can; this one wouldn't.
+		_, err := decompressTransparentPage(page)
+		return pageCheck{Reason: fmt.Sprintf("page-compressed (COMPRESSION=) page doesn't decompress: %v", err)}
 	}
 	if !bytes.Equal(page[filPageLSN+4:filPageLSN+8], page[n-4:n]) {
 		return pageCheck{Reason: "LSN low bytes at the start and end of the page disagree"}

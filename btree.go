@@ -180,8 +180,11 @@ type Row struct {
 // error reporting when a single row fails to decode.
 type RowOrError struct {
 	PageNo, RecOff uint32
-	Row            *Row
-	Err            error
+	// Label, if set, names where the row came from in messages instead of
+	// the page/offset (MyRocks rows have neither - see myrocks.go).
+	Label string
+	Row   *Row
+	Err   error
 	// ProgressBase offsets PageNo for the progress bar only, when one walk
 	// spans several files one after another (a partitioned table - see
 	// partition.go's rowWalker): the pages of every file walked before this
@@ -193,6 +196,8 @@ type RowOrError struct {
 // (MyISAM - see myisam.go) that failed validation.
 type CorruptPage struct {
 	PageNo    uint32
+	Label     string // if set, names the damaged unit instead of PageNo (MyRocks)
+	Info      bool   // a problem worked around without losing anything: warn only, don't count it as skipped
 	Reason    string
 	Truncated bool // pageNo is past the end of the file itself - see collectBatch
 }
@@ -208,6 +213,34 @@ func (t *Table) corruptUnitLabel(pageNo uint32) string {
 		return fmt.Sprintf("record near data-file offset %d", pageNo)
 	}
 	return fmt.Sprintf("page %d (index %q, id %d)", pageNo, t.IndexName, t.IndexID)
+}
+
+// corruptNoun names, for summaries, what a "corrupted N ... skipped"
+// count counts.
+func (t *Table) corruptNoun() string {
+	switch t.Engine {
+	case "ROCKSDB":
+		return "block(s)"
+	case "MyISAM":
+		return "record(s)"
+	}
+	return "page(s)"
+}
+
+// corruptLabel is cp's own label, or corruptUnitLabel's.
+func (t *Table) corruptLabel(cp CorruptPage) string {
+	if cp.Label != "" {
+		return cp.Label
+	}
+	return t.corruptUnitLabel(cp.PageNo)
+}
+
+// rowLabel is roe's own label, or corruptRowLabel's.
+func (t *Table) rowLabel(roe RowOrError) string {
+	if roe.Label != "" {
+		return roe.Label
+	}
+	return t.corruptRowLabel(roe.PageNo, roe.RecOff)
 }
 
 // corruptRowLabel is corruptUnitLabel's counterpart for a single row that

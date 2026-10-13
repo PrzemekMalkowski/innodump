@@ -122,7 +122,7 @@ func decodeField(sp *Space, col *Column, page []byte, fr fieldRange, format outp
 			return "", fmt.Errorf("column %q: float value truncated", col.Name)
 		}
 		v := math.Float32frombits(binary.LittleEndian.Uint32(full))
-		return strconv.FormatFloat(float64(v), 'g', -1, 32), nil
+		return formatFloat32(v), nil
 	case ddDouble:
 		if len(full) < 8 {
 			return "", fmt.Errorf("column %q: double value truncated", col.Name)
@@ -184,6 +184,19 @@ func decodeField(sp *Space, col *Column, page []byte, fr fieldRange, format outp
 	default:
 		return "", fmt.Errorf("column %q has an unsupported type code %d", col.Name, col.DDType)
 	}
+}
+
+// formatFloat32 renders a FLOAT value as the shortest text that reads
+// back as the same float32 - except where that text, read as the double
+// the server parses it into first, would fall outside FLOAT's range (it
+// does for +/-FLT_MAX itself: "3.4028235e+38" > 3.40282346638...e+38),
+// which the server rejects; the value's exact double form is used there.
+func formatFloat32(v float32) string {
+	s := strconv.FormatFloat(float64(v), 'g', -1, 32)
+	if d, err := strconv.ParseFloat(s, 64); err == nil && math.Abs(d) > math.MaxFloat32 {
+		return strconv.FormatFloat(float64(v), 'g', -1, 64)
+	}
+	return s
 }
 
 // quoteText renders a string-valued column (CHAR/VARCHAR/TEXT, decoded ENUM/

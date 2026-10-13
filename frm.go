@@ -109,6 +109,7 @@ type frmKey struct {
 	unique                  bool
 	fulltext, spatial       bool
 	usesComment, usesParser bool
+	comment                 string // the key's COMMENT (MyRocks keeps column family placement here)
 	parts                   []frmKeyPart
 }
 
@@ -181,6 +182,9 @@ func parseFRMKeys(data []byte, keyOff, keyLen uint32) ([]frmKey, error) {
 			break
 		}
 		l := frmU16(buf[pos : pos+2])
+		if pos+2+l <= uint32(len(buf)) {
+			result[i].comment = string(buf[pos+2 : pos+2+l])
+		}
 		pos += 2 + l
 	}
 	return result, nil
@@ -581,6 +585,8 @@ type frmDefinition struct {
 	// itself when the table uses the generic partitioning engine (5.6's
 	// ha_partition, legacyDBTypePartitioned).
 	partDBType byte
+	// engineName is the engine name from the extra segment (frmEngineName).
+	engineName string
 }
 
 // engineIsInnoDB reports whether def describes an InnoDB table - a plain
@@ -638,6 +644,42 @@ func frmPartitionClause(data []byte) string {
 		return ""
 	}
 	return string(seg[pos+4 : pos+4+n])
+}
+
+// frmEngineName returns the storage engine name the .frm's extra segment
+// records (the second of its leading 2-byte-length strings) - the only
+// place a plugin engine such as ROCKSDB is named, its legacy_db_type
+// being a dynamically assigned number. "" if there's none.
+func frmEngineName(data []byte) string {
+	head := data[:frmHeaderSize]
+	extraLen := frmU32(head[55:59])
+	if extraLen == 0 {
+		return ""
+	}
+	recordOffset := frmU16(head[6:8])
+	if frmU16(head[14:16]) == 0xffff {
+		recordOffset += frmU32(head[47:51])
+	} else {
+		recordOffset += frmU16(head[14:16])
+	}
+	start := uint64(recordOffset) + uint64(frmU16(head[16:18]))
+	end := start + uint64(extraLen)
+	if end > uint64(len(data)) {
+		return ""
+	}
+	seg := data[start:end]
+	if len(seg) < 2 {
+		return ""
+	}
+	pos := 2 + int(frmU16(seg[0:2])) // connect string
+	if pos+2 > len(seg) {
+		return ""
+	}
+	n := int(frmU16(seg[pos : pos+2]))
+	if pos+2+n > len(seg) {
+		return ""
+	}
+	return string(seg[pos+2 : pos+2+n])
 }
 
 // Legacy (pre-8.0) .frm storage engine codes - enum legacy_db_type in
@@ -815,7 +857,7 @@ func readFRMDefinition(path string) (*frmDefinition, error) {
 		rawTable.Columns = append(rawTable.Columns, c)
 	}
 	return &frmDefinition{table: rawTable, keys: keys, legacyDBType: head[3], createOptions: frmU16(head[30:32]),
-		partitionClause: frmPartitionClause(data), partDBType: head[61]}, nil
+		partitionClause: frmPartitionClause(data), partDBType: head[61], engineName: frmEngineName(data)}, nil
 }
 
 // frmPrimaryKeyIndex returns the position of keys' PRIMARY KEY, or -1:
@@ -1020,18 +1062,64 @@ func parseMyISAMFRM(path string) (*ddTableJSON, error) {
 	if def.legacyDBType != legacyDBTypeMyISAM {
 		return nil, fmt.Errorf(".frm file's storage engine (%s) is not MyISAM", legacyDBTypeName(def.legacyDBType))
 	}
-	rawTable, keys := def.table, def.keys
+	rawTable := frmPlainTable(def)
+	if rawTable == nil {
+		return nil, fmt.Errorf("an index references an out-of-range column")
+	}
 	rawTable.Engine = "MyISAM"
 	rawTable.RowFormat = rowFormatFixed
 	if def.createOptions&haOptionPackRecord != 0 {
 		rawTable.RowFormat = rowFormatDynamic
 	}
+	return rawTable, nil
+}
 
-	// BuildMyISAMTable expects a PRIMARY KEY (if any) as Indexes[0], same
-	// as an SDI lists it; every element's Length is the key part's own
-	// byte length, which BuildMyISAMTable compares against the column's
-	// own to tell a prefix key from a full-column one - also exactly as
-	// an SDI records it.
+// parseRocksDBFRM reads a MyRocks table's .frm (Percona Server/
+// Facebook MySQL 5.6/5.7, MariaDB) into the shape BuildRocksDBTable takes.
+func parseRocksDBFRM(path string) (*ddTableJSON, error) {
+	def, err := readFRMDefinition(path)
+	if err != nil {
+		return nil, err
+	}
+	// Generic (ha_partition) partitioning names the engine "partition";
+	// such a table only gets here because the MyRocks dictionary lists it.
+	if !def.engineIsRocksDB() && !strings.EqualFold(def.engineName, "partition") {
+		engine := def.engineName
+		if engine == "" {
+			engine = legacyDBTypeName(def.legacyDBType)
+		}
+		return nil, fmt.Errorf(".frm file's storage engine (%s) is not ROCKSDB", engine)
+	}
+	rawTable := frmPlainTable(def)
+	if rawTable == nil {
+		return nil, fmt.Errorf("an index references an out-of-range column")
+	}
+	rawTable.Engine = "ROCKSDB"
+	if def.partitionClause != "" {
+		rawTable.PartitionType = ptHash // any non-zero value: the clause itself is kept as-is
+		rawTable.frmPartitionClause = def.partitionClause
+	}
+	return rawTable, nil
+}
+
+// engineIsRocksDB reports whether def describes a MyRocks table: named so
+// in its extra segment, or (5.6/5.7 generic partitioning, which names the
+// engine "partition") partitioned with every partition ENGINE = ROCKSDB.
+func (def *frmDefinition) engineIsRocksDB() bool {
+	if strings.EqualFold(def.engineName, "ROCKSDB") {
+		return true
+	}
+	return strings.EqualFold(def.engineName, "partition") &&
+		strings.Contains(strings.ToUpper(def.partitionClause), "ENGINE = ROCKSDB")
+}
+
+// frmPlainTable turns def into a dd_object whose Indexes list the PRIMARY
+// KEY (if any) first, as an SDI does - every element's Length the key
+// part's own byte length, which buildPlainTable compares against the
+// column's own to tell a prefix key from a full-column one. nil if a key
+// names a column that doesn't exist.
+func frmPlainTable(def *frmDefinition) *ddTableJSON {
+	rawTable, keys := def.table, def.keys
 	pkIdx := frmPrimaryKeyIndex(keys)
 	order := make([]int, 0, len(keys))
 	if pkIdx >= 0 {
@@ -1044,7 +1132,7 @@ func parseMyISAMFRM(path string) (*ddTableJSON, error) {
 	}
 	for _, i := range order {
 		k := keys[i]
-		idx := ddIndexJSON{Name: k.name, IsVisible: true}
+		idx := ddIndexJSON{Name: k.name, IsVisible: true, Comment: k.comment}
 		switch {
 		case i == pkIdx:
 			idx.Type = ddIndexPrimary
@@ -1059,17 +1147,17 @@ func parseMyISAMFRM(path string) (*ddTableJSON, error) {
 		}
 		for _, p := range k.parts {
 			if p.fieldnr == 0 || int(p.fieldnr) > len(rawTable.Columns) {
-				return nil, fmt.Errorf("index %q references an out-of-range column", k.name)
+				return nil
 			}
 			el := ddIndexElementJSON{ColumnOpx: p.fieldnr - 1, Length: p.length}
 			if k.fulltext || k.spatial {
-				el.Length = 0 // never a prefix - see BuildMyISAMTable
+				el.Length = 0 // never a prefix - see buildPlainTable
 			}
 			idx.Elements = append(idx.Elements, el)
 		}
 		rawTable.Indexes = append(rawTable.Indexes, idx)
 	}
-	return rawTable, nil
+	return rawTable
 }
 
 // tableCharsetID reads the table's own default charset/collation id

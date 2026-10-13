@@ -1,8 +1,8 @@
 // sqlout.go: renders the resolved Table model as a best-effort CREATE
 // TABLE statement, and picks the set of columns that actually appear in
 // INSERT statements (everything except InnoDB's own system columns, SE
-// -hidden housekeeping columns, and virtual generated columns, none of
-// which a user ever supplies a value for).
+// -hidden housekeeping columns, and generated columns, none of which a
+// user ever supplies a value for).
 package main
 
 import (
@@ -15,7 +15,9 @@ import (
 func OutputColumns(t *Table) []*Column {
 	var out []*Column
 	for _, c := range t.Columns {
-		if c.IsSystem || c.Hidden == hiddenSE || c.IsVirtual {
+		if c.IsSystem || c.Hidden == hiddenSE || c.IsVirtual || c.GenExpr != "" {
+			// A STORED generated column is computed again on load (MySQL
+			// rejects an explicit value for it), so it's left out too.
 			continue
 		}
 		out = append(out, c)
@@ -30,6 +32,11 @@ func OutputColumns(t *Table) []*Column {
 // written exactly the same either way, and load into the converted table
 // unchanged.
 var convertMyISAMToInnoDB bool
+
+// convertRocksDBToInnoDB is --rocksdb-to-innodb (main.go): GenerateDDL
+// renders every MyRocks table as ENGINE=InnoDB, without the index
+// COMMENTs MyRocks uses to place indexes in column families.
+var convertRocksDBToInnoDB bool
 
 func backquote(name string) string {
 	return "`" + strings.ReplaceAll(name, "`", "``") + "`"
@@ -82,9 +89,14 @@ func GenerateDDL(t *Table) string {
 	fmt.Fprintf(&b, "-- generated columns, the PRIMARY KEY, secondary indexes, FOREIGN KEY\n")
 	fmt.Fprintf(&b, "-- constraints, and the default charset/collation are reproduced; DEFAULT\n")
 	fmt.Fprintf(&b, "-- clauses and other table options are not. AUTO_INCREMENT (if any) is\n")
-	fmt.Fprintf(&b, "-- the highest value seen in the data plus one, not the server's persisted\n")
-	fmt.Fprintf(&b, "-- counter (the SDI doesn't carry that) - it may be behind if rows were\n")
-	fmt.Fprintf(&b, "-- deleted from the high end.\n")
+	if t.Engine == "ROCKSDB" {
+		fmt.Fprintf(&b, "-- MyRocks' own persisted counter, or the highest value seen in the data\n")
+		fmt.Fprintf(&b, "-- plus one if that's higher.\n")
+	} else {
+		fmt.Fprintf(&b, "-- the highest value seen in the data plus one, not the server's persisted\n")
+		fmt.Fprintf(&b, "-- counter (the SDI doesn't carry that) - it may be behind if rows were\n")
+		fmt.Fprintf(&b, "-- deleted from the high end.\n")
+	}
 	engine := t.Engine
 	var autoIncKey string
 	if t.Engine == "MyISAM" && convertMyISAMToInnoDB {
@@ -97,6 +109,17 @@ func GenerateDDL(t *Table) string {
 			fmt.Fprintf(&b, "-- index, which MyISAM doesn't. Note that InnoDB's counter is table-wide, not\n")
 			fmt.Fprintf(&b, "-- per-group like MyISAM's for an AUTO_INCREMENT that isn't a key's first column.\n")
 		}
+	}
+	dropIndexComments := false
+	if t.Engine == "ROCKSDB" && convertRocksDBToInnoDB {
+		engine = "InnoDB"
+		dropIndexComments = true
+		fmt.Fprintf(&b, "-- Converted from ENGINE=ROCKSDB to ENGINE=InnoDB (--rocksdb-to-innodb); index COMMENTs,\n")
+		fmt.Fprintf(&b, "-- which MyRocks uses for column family placement, are left out.\n")
+	}
+	pkComment := t.PKComment
+	if dropIndexComments {
+		pkComment = ""
 	}
 	fmt.Fprintf(&b, "CREATE TABLE %s.%s (\n", backquote(t.SchemaRef), backquote(t.Name))
 
@@ -162,9 +185,9 @@ func GenerateDDL(t *Table) string {
 	}
 	if t.HasExplicitPK {
 		if t.PKIsUniqueKey {
-			lines = append(lines, "  UNIQUE KEY "+backquote(t.IndexName)+" ("+secondaryIndexColumnList(t.PKFieldsAsColumns())+")")
+			lines = append(lines, "  UNIQUE KEY "+backquote(t.IndexName)+" ("+secondaryIndexColumnList(t.PKFieldsAsColumns())+")"+indexCommentClause(pkComment))
 		} else {
-			lines = append(lines, "  PRIMARY KEY ("+secondaryIndexColumnList(t.PKFieldsAsColumns())+")")
+			lines = append(lines, "  PRIMARY KEY ("+secondaryIndexColumnList(t.PKFieldsAsColumns())+")"+indexCommentClause(pkComment))
 		}
 	}
 	for _, si := range t.SecondaryIndexes {
@@ -186,7 +209,11 @@ func GenerateDDL(t *Table) string {
 				cols[i] = SecondaryIndexColumn{Col: c.Col}
 			}
 		}
-		line := fmt.Sprintf("  %s %s (%s)", kind, backquote(si.Name), secondaryIndexColumnList(cols))
+		siComment := si.Comment
+		if dropIndexComments {
+			siComment = ""
+		}
+		line := fmt.Sprintf("  %s %s (%s)", kind, backquote(si.Name), secondaryIndexColumnList(cols)) + indexCommentClause(siComment)
 		if !si.Visible {
 			line += " /*!80000 INVISIBLE */"
 		}
@@ -224,6 +251,8 @@ func GenerateDDL(t *Table) string {
 	b.WriteString(strings.Join(lines, ",\n"))
 	fmt.Fprintf(&b, "\n) ENGINE=%s", engine)
 	switch engine {
+	case "ROCKSDB":
+		// MyRocks has no ROW_FORMAT of its own.
 	case "MyISAM":
 		// SHOW CREATE TABLE only states ROW_FORMAT= when it differs from
 		// what MyISAM would pick on its own: FIXED if every column is
@@ -258,11 +287,30 @@ func GenerateDDL(t *Table) string {
 		// uca1400Charset), so this
 		// can only state the charset, not COLLATE=<the real collation>.
 	}
+	if t.Compression != "" && engine == "InnoDB" {
+		fmt.Fprintf(&b, " COMPRESSION=%s", quoteSQLString(t.Compression))
+	}
+	if t.Comment != "" {
+		fmt.Fprintf(&b, " COMMENT=%s", quoteSQLString(t.Comment))
+	}
 	// A partitioned table's PARTITION BY clause comes last, after every
 	// table option, exactly where SHOW CREATE TABLE puts it (partition.go).
-	b.WriteString(t.PartitionClause)
+	clause := t.PartitionClause
+	if t.Engine == "ROCKSDB" && convertRocksDBToInnoDB {
+		clause = strings.ReplaceAll(clause, "ENGINE = ROCKSDB", "ENGINE = InnoDB")
+	}
+	b.WriteString(clause)
 	b.WriteString(";\n")
 	return b.String()
+}
+
+// indexCommentClause renders an index's COMMENT the way SHOW CREATE TABLE
+// does, or "" if it has none.
+func indexCommentClause(comment string) string {
+	if comment == "" {
+		return ""
+	}
+	return " COMMENT " + quoteSQLString(comment)
 }
 
 // myisamToInnoDBAutoIncKey returns the name of the extra KEY a MyISAM

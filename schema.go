@@ -160,6 +160,7 @@ type ddIndexElementJSON struct {
 
 type ddIndexJSON struct {
 	Name          string               `json:"name"`
+	Comment       string               `json:"comment"`
 	Hidden        bool                 `json:"hidden"`
 	IsVisible     bool                 `json:"is_visible"`
 	SePrivateData string               `json:"se_private_data"`
@@ -175,6 +176,7 @@ type ddTableJSON struct {
 	SePrivateID   uint64         `json:"se_private_id"`
 	Comment       string         `json:"comment"`
 	SePrivateData string         `json:"se_private_data"`
+	Options       string         `json:"options"`
 	Engine        string         `json:"engine"`
 	RowFormat     uint32         `json:"row_format"`
 	PartitionType uint32         `json:"partition_type"`
@@ -189,6 +191,9 @@ type ddTableJSON struct {
 	CollationID                uint64             `json:"collation_id"`
 	Indexes                    []ddIndexJSON      `json:"indexes"`
 	ForeignKeys                []ddForeignKeyJSON `json:"foreign_keys"`
+	// frmPartitionClause is a .frm-described table's own PARTITION BY
+	// clause (MyRocks only; InnoDB's .frm path keeps it elsewhere).
+	frmPartitionClause string
 }
 
 // ddPartitionJSON is one partition (or, nested in Subpartitions, one
@@ -394,6 +399,7 @@ type SecondaryIndexColumn struct {
 // SecondaryIndex is a non-PRIMARY index, for DDL output only.
 type SecondaryIndex struct {
 	Name              string
+	Comment           string // the index's own COMMENT (MyRocks keeps column family placement here)
 	Unique            bool
 	Fulltext, Spatial bool
 	Visible           bool
@@ -460,10 +466,36 @@ type Table struct {
 	// fills this in from the highest value actually seen while walking rows.
 	AutoIncrementCol  *Column
 	AutoIncrementNext *uint64
+	// AutoIncrementStored is the engine's own persisted next value, when it
+	// keeps one where this tool can read it (MyRocks' dictionary does);
+	// the DDL then uses whichever of it and the data-derived value is higher.
+	AutoIncrementStored uint64
 
 	RootPage  uint32
 	IndexID   uint64
 	IndexName string // the clustered index's own SDI name (usually "PRIMARY")
+	PKComment string // the PRIMARY KEY's own COMMENT, if any
+	// Compression is InnoDB transparent page compression as the table
+	// options record it ("zlib", "lz4", "none"; "" if never set) - see
+	// page.go's decompressTransparentPage.
+	Compression string
+}
+
+// sdiUnescape undoes the one level of backslash escaping the DD applies
+// to a generated column's expression text (generation_expression_utf8,
+// also what I_S.COLUMNS shows): \' for ', \\ for \.
+func sdiUnescape(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // decodeElements base64-decodes the ENUM/SET label list from the SDI.
@@ -517,8 +549,11 @@ func packLength(c *ddColumnJSON) (uint32, error) {
 			lenBytes = 2
 		}
 		return lenBytes + c.CharLength, nil
-	case ddBlob, ddGeometry, ddJSON, ddVector:
+	case ddBlob, ddVector:
 		return 2 + 8, nil
+	case ddGeometry, ddJSON:
+		// Field_geom/Field_json are BLOBs with a 4-byte length (packlength 4).
+		return 4 + 8, nil
 	case ddMediumBlob:
 		return 3 + 8, nil
 	case ddTinyBlob:
@@ -690,7 +725,7 @@ func buildColumn(raw ddColumnJSON) (*Column, error) {
 		CollationID:         raw.CollationID,
 		IsExplicitCollation: raw.IsExplicitCollation,
 		Comment:             raw.Comment,
-		GenExpr:             raw.GenerationExpressionUtf8,
+		GenExpr:             sdiUnescape(raw.GenerationExpressionUtf8),
 		Elements:            decodeElements(raw.Elements),
 		HasDefault:          !raw.HasNoDefault && !raw.DefaultValueUtf8Null,
 		DefaultText:         raw.DefaultValueUtf8,
@@ -791,6 +826,7 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 		SePrivateID: raw.SePrivateID,
 		Comment:     raw.Comment,
 		CollationID: raw.CollationID,
+		Compression: sePropString(raw.Options)["compress"],
 	}
 	for _, c := range colsByOpx {
 		if c.IsAutoIncrement {
@@ -930,6 +966,7 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 		}
 		si := &SecondaryIndex{
 			Name:     idx.Name,
+			Comment:  idx.Comment,
 			Unique:   idx.Type == ddIndexUnique,
 			Fulltext: idx.Type == ddIndexFulltext,
 			Spatial:  idx.Type == ddIndexSpatial,

@@ -382,6 +382,14 @@ func BuildMyISAMTable(raw *ddTableJSON) (*Table, error) {
 		return nil, fmt.Errorf("ROW_FORMAT %s is not supported for MyISAM (v1 limitation)", rowFormatName(raw.RowFormat))
 	}
 
+	return buildPlainTable(raw, "MyISAM")
+}
+
+// buildPlainTable is the engine-agnostic part of BuildMyISAMTable, shared
+// with MyRocks (BuildRocksDBTable): a table whose dd columns list exactly
+// its physical columns in CREATE TABLE order, with no clustered-index
+// system columns or InnoDB-style INSTANT bookkeeping to resolve.
+func buildPlainTable(raw *ddTableJSON, engine string) (*Table, error) {
 	colsByOpx := make([]*Column, len(raw.Columns))
 	for i, rc := range raw.Columns {
 		c, err := buildColumn(rc)
@@ -394,7 +402,7 @@ func BuildMyISAMTable(raw *ddTableJSON) (*Table, error) {
 	t := &Table{
 		Name:        raw.Name,
 		SchemaRef:   raw.SchemaRef,
-		Engine:      "MyISAM",
+		Engine:      engine,
 		RowFormat:   raw.RowFormat,
 		SePrivateID: raw.SePrivateID,
 		Comment:     raw.Comment,
@@ -420,6 +428,7 @@ func BuildMyISAMTable(raw *ddTableJSON) (*Table, error) {
 	if len(raw.Indexes) > 0 && raw.Indexes[0].Type == ddIndexPrimary {
 		t.HasExplicitPK = true
 		t.IndexName = raw.Indexes[0].Name
+		t.PKComment = raw.Indexes[0].Comment
 		for _, el := range raw.Indexes[0].Elements {
 			if el.Hidden {
 				break
@@ -447,6 +456,7 @@ func BuildMyISAMTable(raw *ddTableJSON) (*Table, error) {
 		}
 		si := &SecondaryIndex{
 			Name:     idx.Name,
+			Comment:  idx.Comment,
 			Unique:   idx.Type == ddIndexUnique,
 			Fulltext: idx.Type == ddIndexFulltext,
 			Spatial:  idx.Type == ddIndexSpatial,
@@ -1460,7 +1470,7 @@ func decodeMyISAMField(col *Column, raw []byte, format outputFormat) (lit string
 		if len(raw) < 4 {
 			return "", fmt.Errorf("column %q: float value truncated", col.Name)
 		}
-		return strconv.FormatFloat(float64(math.Float32frombits(binary.LittleEndian.Uint32(raw))), 'g', -1, 32), nil
+		return formatFloat32(math.Float32frombits(binary.LittleEndian.Uint32(raw))), nil
 	case ddDouble:
 		if len(raw) < 8 {
 			return "", fmt.Errorf("column %q: double value truncated", col.Name)

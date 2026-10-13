@@ -15,6 +15,11 @@ definition and rows without a running server:
   their DDL as `ENGINE=InnoDB` for migrations.
 - **Partitioned** InnoDB tables, extracted as one table from all their
   partition files (see "Partitioned tables").
+- **MyRocks** (`ENGINE=ROCKSDB`) tables, read straight from the datadir's
+  RocksDB files (`.rocksdb/`: SST files, write-ahead logs, MANIFEST), schema
+  from the `.sdi` (Percona Server 8.0, 8.4, 9.7) or `.frm` (Percona Server
+  5.7, MariaDB) - including damaged and crashed ones; see "MyRocks support".
+  `--rocksdb-to-innodb` writes their DDL as `ENGINE=InnoDB` for migrations.
 
 By default it writes, under `./sqldump_<timestamp>/`:
 
@@ -29,8 +34,8 @@ records them, not after the source file - `mysql.ibd`'s `user` table gives
 
 `--format tsv` writes a MySQL Shell `util.loadDump()`-compatible dump
 directory instead (see "TSV output"). `--source-dir DIR` extracts every
-table in a datadir or database directory, InnoDB and MyISAM alike, into
-one combined dump (see "Bulk extraction").
+table in a datadir or database directory, InnoDB, MyISAM and MyRocks
+alike, into one combined dump (see "Bulk extraction").
 
 > **This is not a backup tool.** `innodump` reads whatever bytes are in
 > the files it's given. It doesn't coordinate with a server (no locking, no
@@ -57,6 +62,10 @@ and across every leaf page via the sibling pointers, decoding each record's
 NULL bitmap and variable-length field list the way InnoDB does. Off-page
 BLOB/TEXT/JSON values are followed through the LOB pages to recover the
 full value.
+
+MyRocks tables are read differently - from the datadir's RocksDB files,
+merging SST files and write-ahead logs into the current state of every
+key - see "MyRocks support".
 
 ## Example runs
 
@@ -114,12 +123,23 @@ Columns:     4 output (6 total incl. system/hidden)
 Schema file: sqldump_2026-09-08_22.17/sbtest.sbtest1-schema.sql
 Data file:   sqldump_2026-09-08_22.17/sbtest.sbtest1-data-deleted.sql (2100 delete-marked row(s) written)
 ```
+```
+$ innodump --file /backup/rocks2/rocks/sbtest15_673.sdi
+warning: RocksDB: 1 prepared transaction(s) have no XID event in the binary log - rolled back, as crash recovery would
+=== innodump 0.8.0 ===
+Table:       rocks.sbtest15 (engine=ROCKSDB)
+Columns:     4 output (4 total incl. system/hidden)
+Schema file: sqldump_2026-10-13_20.07/rocks.sbtest15-schema.sql
+Data file:   sqldump_2026-10-13_20.07/rocks.sbtest15-data.sql (10000 row(s) written)
+```
 
 ## Build
 
-Requires Go 1.21+. The one dependency,
-[klauspost/compress](https://github.com/klauspost/compress) (pure Go, used
-only for `--compression=zstd`), is fetched on first build.
+Requires Go 1.21+. Two dependencies, both pure Go, are fetched on first
+build: [klauspost/compress](https://github.com/klauspost/compress) (zstd,
+for `--compression=zstd` and for reading zstd-compressed RocksDB blocks)
+and [zeebo/xxh3](https://github.com/zeebo/xxh3) (the XXH3 checksum newer
+RocksDB versions put on every block).
 
 ```sh
 go build -o innodump .
@@ -137,8 +157,8 @@ innodump --file /path/to/table.ibd [options]
 
 | Flag | Description |
 |------|-------------|
-| `--file PATH` | The `.ibd` file, or a MyISAM table's `.MYD`/`.MYI` file. Required unless `--source-dir` is given. Any one partition's file (`table#p#p0.ibd`) extracts the whole partitioned table. |
-| `--source-dir DIR` | Recursively scan DIR for `.ibd` and `.MYD` files and extract every table they hold. Not combinable with `--file` or `--table`. Refuses a DIR that isn't one instance's datadir or one database directory - see `--force-scan`. |
+| `--file PATH` | The `.ibd` file, or a MyISAM table's `.MYD`/`.MYI` file. Required unless `--source-dir` is given. Any one partition's file (`table#p#p0.ibd`) extracts the whole partitioned table. For a MyRocks table: the datadir (or its `.rocksdb` directory) with `--table`, or the table's `.sdi`/`.frm` (see "MyRocks support"). |
+| `--source-dir DIR` | Recursively scan DIR for `.ibd` and `.MYD` files, plus a MyRocks `.rocksdb`/`#rocksdb` directory, and extract every table they hold. Not combinable with `--file` or `--table`. Refuses a DIR that isn't one instance's datadir or one database directory - see `--force-scan`. |
 | `--force-scan` | With `--source-dir`, scan DIR even if it doesn't look like a single datadir or database directory. |
 | `--include-system-schemas` | With `--source-dir --format=tsv`, also dump `mysql`, `sys`, `performance_schema`, `information_schema` and `ndbinfo` (left out by default). |
 | `--out-dir DIR` | Output directory (default `./sqldump_<timestamp>` for `sql`, `./tsvdump_<timestamp>` for `tsv`, timestamped `date +%Y-%m-%d_%H.%M`; created if missing). |
@@ -149,7 +169,10 @@ innodump --file /path/to/table.ibd [options]
 | `--limit N` | Stop after N rows (0 = all). |
 | `--ddl-only` | Only write the schema file(s); don't read any row data. |
 | `--myisam-to-innodb` | Write MyISAM tables' DDL as `ENGINE=InnoDB`, adding a `KEY` where InnoDB would reject the `AUTO_INCREMENT` column. Row data is unchanged. |
-| `--deleted-only` | Dump only deleted rows that are still recoverable - delete-marked, purged-but-not-overwritten, or on freed pages - instead of live rows (see "Recovering deleted rows"). The data file gets a `-deleted` suffix. |
+| `--rocksdb-to-innodb` | Write MyRocks tables' DDL as `ENGINE=InnoDB`, without the index `COMMENT`s MyRocks uses for column family placement. Row data is unchanged. |
+| `--rocksdb-dir DIR` | MyRocks: the RocksDB directory, when it isn't the datadir's own `.rocksdb/` (`rocksdb_datadir` pointed elsewhere). |
+| `--rocksdb-index N` | MyRocks recovery: read `--table`'s rows from index number N, whatever MyRocks' own dictionary says - for when it has lost track of the table (see "When the MyRocks dictionary is damaged"). `--file` and `--table` only. |
+| `--deleted-only` | Dump only deleted rows that are still recoverable - delete-marked, purged-but-not-overwritten, or on freed pages (for MyRocks: rows whose deletion hasn't been compacted away yet) - instead of live rows (see "Recovering deleted rows"). The data file gets a `-deleted` suffix. |
 | `--yes` | Overwrite existing output without asking (also `YES=1`). Otherwise an existing output file triggers a y/N prompt, or a refusal when there's no terminal; for `tsv` only the dump's `@.json` is checked. |
 | `--skip-corrupted` | On a corrupted page or record, note it and carry on where possible instead of stopping. |
 | `--no-progress` | Never draw the progress bar (also `NO_PROGRESS=1`). |
@@ -281,7 +304,18 @@ Supported:
   COLUMN` history under both the 8.0.12–8.0.28 mechanism and 8.0.29+ row
   versioning (see "INSTANT ADD/DROP COLUMN").
 - MySQL 5.5–5.7 and MariaDB tables, via their `.frm` (see below).
-- Partitioned InnoDB tables, and MyISAM tables (see their sections).
+- Partitioned InnoDB tables, MyISAM tables, and MyRocks tables (see their
+  sections).
+
+Transparent page compression (`CREATE TABLE ... COMPRESSION='zlib'` or
+`'lz4'`, MySQL 5.7+) is undone page by page as the server's own I/O layer
+does it - restore the compressed body after the FIL header, then check the
+page's checksum - so every page type (index, SDI, LOB, allocation) reads
+as usual, and the DDL keeps the table's `COMPRESSION=` option. A page that
+won't decompress is reported like any corrupted page. (MySQL's own
+`ibd2sdi` can't read the SDI of such a tablespace; `innodump` can.)
+Checked against Percona Server 8.0.35/8.0.46 zlib and LZ4 tables, reloaded
+and compared row for row.
 
 `ROW_FORMAT=REDUNDANT`'s older record layout (a per-field offset array
 instead of a NULL bitmap and length list) is decoded by `redundant.go`.
@@ -486,6 +520,226 @@ do when loaded onto 8.0 (see "Validation"). The `mysql` schema's MyISAM
 tables are converted too, but they're for inspection, not for loading over
 a new server's own `mysql` schema (`--format=tsv` leaves them out unless
 `--include-system-schemas` is given).
+
+## MyRocks support
+
+MyRocks keeps every `ENGINE=ROCKSDB` table of an instance in one RocksDB
+database: the datadir's `.rocksdb/` directory (`#rocksdb/` on MariaDB).
+`innodump` reads that directory itself - no RocksDB library, no server:
+
+- the **MANIFEST** (named by `CURRENT`), replayed to find each column
+  family's live SST files and the oldest write-ahead log still needed;
+- every live **SST file** (RocksDB's block-based table format), each block
+  checksum-verified before use;
+- the **write-ahead logs** (`NNNNNN.log`) - writes not yet flushed to an
+  SST file, which on a crashed or still-running server can be a lot -
+  replayed the way RocksDB's own recovery does, including MyRocks'
+  two-phase-commit `PREPARE`/`COMMIT` markers (see below);
+
+and merges them into one view: for each key, the newest version wins, and
+deletions (point and range) hide what's beneath them, exactly as a
+RocksDB read does.
+
+MyRocks' own data dictionary (kept in RocksDB itself, in the `__system__`
+column family) maps each table to its index numbers; a table's rows are
+its primary key's keys (or its hidden primary key's, for a table without
+one). The column definitions come from the table's `.sdi` file (Percona
+Server 8.0+, the same file as for MyISAM) or `.frm` (Percona Server 5.7,
+MariaDB). Each row is then decoded the way MyRocks' own `Rdb_converter`
+and `Rdb_key_def` do it: the value holds the non-key columns in MySQL's
+record format, and the primary key columns are decoded back out of the
+key's mem-comparable form - integers, floating point, `DECIMAL`, temporal
+types, `ENUM`/`SET`/`BIT`, binary strings, `_bin` collations, 8-bit
+collations like `latin1_swedish_ci` (with the extra "unpack info" MyRocks
+keeps in the value), and, for other collations, the copy MyRocks stores
+there. The rules for which key columns are decodable differ between the
+5.7-era and 8.0 MyRocks, and `innodump` follows whichever wrote the table.
+
+```sh
+# One table: point --file at the datadir (or its .rocksdb directory) ...
+innodump --file /var/lib/mysql --table shop.orders
+# ... or at the table's own schema file.
+innodump --file /var/lib/mysql/shop/orders_1234.sdi
+# Every table - InnoDB, MyISAM and MyRocks alike.
+innodump --source-dir /var/lib/mysql --format tsv
+```
+
+```
+$ innodump --file . --table w1.big
+=== innodump 0.8.0 ===
+Table:       w1.big (engine=ROCKSDB)
+Columns:     3 output (3 total incl. system/hidden)
+Schema file: out/w1.big-schema.sql
+Data file:   out/w1.big-data.sql (47999 row(s) written)
+```
+
+`--rocksdb-dir` names the RocksDB directory when `rocksdb_datadir` put it
+somewhere else. `--verbose` lists the column families, their live SST
+files and unflushed WAL entries, and the table's index number, column
+family and `kv_format_version`.
+
+The DDL keeps MyRocks' index `COMMENT`s (`cfname=...`, which place an index
+in a column family) and the table `COMMENT` (where `ttl_duration` lives),
+and its `AUTO_INCREMENT` is MyRocks' own persisted counter (or the highest
+value in the data plus one, if that's higher). Rows come out in primary
+key order (descending, for a reverse-ordered `rev:` column family). Partitioned tables come out as one table, partition by
+partition, as for InnoDB.
+
+### What's supported
+
+- Percona Server 8.0, 8.4 and 9.7 (`.sdi`), Percona Server 5.7 and
+  MariaDB 10.x (`.frm`, including 5.6-style generic partitioning).
+- SST `format_version` 0-6 (2-6 tested against real files); checksums
+  CRC32c, xxHash, xxHash64, XXH3, or none; block compression none, LZ4,
+  LZ4HC, ZSTD (with or without a dictionary), Zlib, Snappy and BZip2 (the
+  last two not tested against real files - the Percona build used has
+  neither - though the Snappy decoder was checked against a reference
+  encoder); every index type (binary search, hash, two-level/partitioned,
+  with first key) and the data block hash index.
+- Bulk-loaded (`rocksdb_bulk_load`, ingested) SST files, reverse-ordered
+  (`rev:`) and custom column families, range deletions, TTL tables
+  (rows past their TTL are left out, as the server's own reads hide them),
+  `INSTANT ADD COLUMN`, hidden primary keys, and a `UNIQUE NOT NULL` key
+  the server promoted to the clustered index.
+- `--deleted-only`: rows whose newest version is a deletion but whose
+  previous version is still there - until compaction drops both.
+
+### Two-phase commit and the binary log
+
+With the binlog enabled, MyRocks commits every transaction in two phases:
+its writes go into the WAL as a `PREPARE` section, the transaction is
+written to the binlog, and only then is a `COMMIT` marker added to the
+WAL - which MyRocks doesn't even flush straight away, since the binlog is
+enough to decide. So a WAL copied from a crashed or running server
+routinely ends with prepared sections whose `COMMIT` never made it to the
+file. On restart the server commits those whose XID is in the binlog and
+rolls back the rest; `innodump` does the same, reading the XID events of
+the binlog files its `.index` lists in the datadir. Without them, it
+leaves such transactions out and says how many there were.
+
+### Damaged and crashed instances
+
+A copy of a crashed server's datadir - unflushed WAL, prepared
+transactions and all - reads like a clean one. Validated on a Percona
+Server that aborted mid-flush and then refused to start (`ROCKSDB_CORRUPTED`):
+every row came out, identical to what the server recovered once forced
+to start.
+
+Every block is checked before it's used. As for InnoDB, damage is fatal by
+default (stopping with the file, offset and reason) and skipped with
+`--skip-corrupted`:
+
+```
+$ innodump --file . --table bk.bl
+...
+Error: walking table rows: 000133.sst: data block (offset 5588759, size 12974): block checksum mismatch (XXH3, stored 0x5a8e7b08, computed 0x0dd8bed3) (pass --skip-corrupted to skip damaged blocks and carry on)
+$ innodump --file . --table bk.bl --skip-corrupted
+...
+warning: corrupted RocksDB file 000133.sst: data block (offset 5588759, size 12974): block checksum mismatch (XXH3, stored 0x5a8e7b08, computed 0x0dd8bed3)
+Data file:   out/bk.bl-data.sql (199601 row(s) written, 1 corrupted block(s) skipped - see warnings above)
+```
+
+- **A damaged data block** loses the rows stored in it (299 of 199,900
+  above). Skipping it can surface an *older* version of a key from another
+  file, or a deleted row from before the deletion; rows in the key range
+  of a skipped block are counted in a closing note.
+- **A damaged index, metaindex or footer** - or an SST file **cut short**
+  by an incomplete copy - doesn't lose the rest of the file: its data
+  blocks are found by scanning it from the start (where each block ends
+  is worked out from its own structure, and only a block whose checksum
+  matches is used). A file whose index alone is damaged comes back
+  complete, with just a warning; a truncated one loses only what came
+  after the cut, and is flagged `[source file truncated]`.
+- **A missing SST file** the MANIFEST lists is reported for each table
+  whose key range it overlapped.
+- **A damaged WAL record** loses the transaction (WriteBatch) it held;
+  reading resumes at the next 32KB log block. A torn last record (a crash
+  mid-write) is normal and only noted.
+- **A missing or damaged MANIFEST** (or `CURRENT`): every SST file present
+  is treated as live, with a warning that rows deleted long ago could
+  reappear if a crash left obsolete files behind.
+
+Tested by flipping bytes in data blocks, destroying an index block,
+truncating an SST file to 70% of its length, deleting SST files, the
+MANIFEST and `CURRENT`, damaging WALs, and damaging 2% of every SST
+file's bytes at random: each case recovered what the damage left intact
+and reported the rest.
+
+### When the MyRocks dictionary is damaged
+
+If the `__system__` column family's own blocks are lost, a table can drop
+out of MyRocks' dictionary while its rows, in other files, are intact.
+For a table whose `.sdi`/`.frm` is present but which the dictionary
+doesn't list, `innodump` looks through the index numbers holding data
+that no dictionary entry claims, in the column family its primary key's
+`COMMENT` names, and decodes a sample of each one's rows with the table's
+own layout: an index whose rows all decode with every byte accounted for
+fits. A table only one such index fits - and which no other table also
+fits - is extracted from it, with a warning. When several fit (tables of
+the same shape, or an older copy of the table, e.g. from an `ALTER TABLE`,
+not yet compacted away) it isn't guessed at: the candidates are listed,
+and `--file <datadir> --table <schema.table> --rocksdb-index <N>` reads
+the one you pick (newer tables get higher numbers).
+
+### Migrating to InnoDB (`--rocksdb-to-innodb`)
+
+`--rocksdb-to-innodb` writes every MyRocks table's DDL as `ENGINE=InnoDB`
+(partitions included) and leaves out the index `COMMENT`s MyRocks uses for
+column family placement; rows are unchanged. It's also the only way to
+load a `--format=tsv` dump of MyRocks tables with MySQL Shell's
+`util.loadDump()`, which loads data at `READ UNCOMMITTED` - an isolation
+level MyRocks refuses (`--format=sql` dumps load into MyRocks fine).
+
+### Limitations
+
+- `wal_compression` WALs, BlobDB blob files, wide-column
+  entities and user-defined timestamps aren't read (MyRocks uses none of
+  them by default); RocksDB's PlainTable/CuckooTable SST formats aren't
+  either (MyRocks never writes them).
+- Only primary keys are read - secondary indexes appear in the DDL only.
+  A table whose primary key the dictionary lost *and* which is
+  partitioned can't be matched to its rows (see above).
+- `--dump-page` and `--debug` apply to InnoDB only.
+
+### Validation
+
+Checked end to end, as for InnoDB: each table dumped (from a copy of a
+live datadir, a cleanly stopped one, and a crashed one), reloaded, and
+compared row for row with the original (`mysqldump --hex-blob
+--order-by-primary` of both, identical):
+
+- **Percona Server 8.4.11**: every scalar type (including `JSON`, `BIT`,
+  `ENUM`/`SET`, all temporal types with fractional seconds, `BLOB`s up to
+  5MB, stored/virtual generated and invisible columns); a primary key over
+  every decodable type and collation family (`utf8mb4_0900_ai_ci`,
+  `utf8mb4_general_ci`, `utf8mb3_general_ci`, `utf8mb4_bin`, `utf8mb3_bin`,
+  `latin1_bin`, `latin1_swedish_ci`, binary, prefix keys, composite keys);
+  hidden and promoted-`UNIQUE` primary keys; RANGE/HASH/subpartitioned
+  tables; reverse and custom column families; TTL and `INSTANT ADD
+  COLUMN` tables; 250,000 bulk-loaded rows; tables after full manual
+  compaction; and six column families covering ZSTD (with a trained
+  dictionary), Zlib, LZ4, LZ4HC and no compression, all four checksum
+  types plus none, `format_version` 2-6 and all four index types.
+  `--format=tsv --rocksdb-to-innodb` dumps were loaded with
+  `util.loadDump()` and matched as well.
+- **Percona Server 9.7.2**: MyRocks tables, a partitioned one among them.
+- **Percona Server 8.0.35**: the MyRocks tables of a real 8.0 datadir.
+- **Percona Server 5.7.44** and **MariaDB 10.6.28** (`.frm`, older
+  `kv_format_version`): the same approach over every type, `latin1`,
+  `utf8`, `utf8mb4_bin` and binary keys, hidden keys, partitioned and
+  reverse-ordered tables.
+
+So MyRocks extraction is tested on Percona Server 5.7, 8.0, 8.4 and 9.7,
+and on MariaDB 10.6.
+
+A RocksDB directory whose dictionary reads fine but lists no tables, with
+no data outside `__system__` (an instance where MyRocks was enabled but
+never used), is reported as holding no MyRocks tables rather than as
+damaged.
+
+Speed: about 600,000 rows/s for a 3-million-row table on 22 cores (the
+RocksDB merge itself is sequential; decoding and rendering rows runs in
+parallel, as for InnoDB).
 
 ## Partitioned tables
 
@@ -845,6 +1099,13 @@ table: the default run stopped with the exact page, index and reason, and
 "Corrupted pages" for the heavier random-damage tests.
 
 ## Acknowledgements
+
+The RocksDB formats (SST, WAL, MANIFEST) and MyRocks' key/value encoding
+were worked out from the RocksDB and MyRocks source Percona Server 8.4
+bundles (`storage/rocksdb`), with Percona Server 5.7's and MariaDB's
+MyRocks for their older rules, and checked against RocksDB's own
+`sst_dump` and `ldb` tools. This project is not affiliated with Meta,
+Percona or the RocksDB project.
 
 The on-disk page, record, SDI and LOB formats were cross-referenced
 against the public `mysql-server` source (`storage/innobase`) and against

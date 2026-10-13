@@ -19,7 +19,9 @@
 // COLUMN history is supported - see instant.go), plus MySQL 5.6/5.7 given
 // the table's .frm file alongside it. See schema.go's and frm.go's package
 // comments and the README for why, and BuildTable's errors for exactly
-// which of these a given file trips.
+// which of these a given file trips. MyISAM tables (myisam.go) and MyRocks
+// tables - read straight from the datadir's RocksDB files (myrocks.go,
+// rocksdb_db.go) - are extracted too.
 //
 // # Copyright (C) 2026 Przemysław Malkowski
 //
@@ -61,11 +63,11 @@ const appName = "innodump"
 // The hardcoded fallback below is what a plain "go build"/"go install"
 // (no ldflags) prints instead - kept in sync with the latest tagged
 // release by hand.
-var version = "0.7.9"
+var version = "0.8.0"
 
 var (
-	filePath             = flag.String("file", "", "Path to the .ibd file to extract")
-	sourceDir            = flag.String("source-dir", "", "Recursively scan this directory for .ibd files and extract every table found in each, instead of a single --file")
+	filePath             = flag.String("file", "", "Path to the .ibd file to extract - or, for a MyRocks table, the datadir (or its .rocksdb directory, or the table's .sdi/.frm), with --table")
+	sourceDir            = flag.String("source-dir", "", "Recursively scan this directory for .ibd and .MYD files, plus a MyRocks .rocksdb directory, and extract every table found, instead of a single --file")
 	forceScan            = flag.Bool("force-scan", false, "With --source-dir, scan a directory even if it doesn't look like a single instance's datadir or a single database directory (see the README's \"Bulk extraction\" section)")
 	includeSystemSchemas = flag.Bool("include-system-schemas", false, "With --source-dir and --format=tsv, also dump system schemas (mysql, sys, performance_schema, information_schema, ndbinfo) - excluded by default, matching MySQL Shell's own util.dumpInstance() default")
 	outDir               = flag.String("out-dir", "", "Directory for the output files (default: ./sqldump_<timestamp> for --format=sql, ./tsvdump_<timestamp> for --format=tsv, timestamped date +%Y-%m-%d_%H.%M; created if it doesn't exist)")
@@ -83,6 +85,9 @@ var (
 	showVersion          = flag.Bool("version", false, "Print version and exit")
 	dumpPage             = flag.Int("dump-page", -1, "debug: hex-dump one page and its record chain, then exit (requires --file)")
 	debug                = flag.Bool("debug", false, "debug: print each record's decoded field byte-ranges as they're read")
+	rocksdbIndex         = flag.Uint("rocksdb-index", 0, "MyRocks recovery: read --table's rows from this index number, whatever the MyRocks dictionary says (or when it has lost track of the table - see the README)")
+	rocksdbDir           = flag.String("rocksdb-dir", "", "MyRocks: the RocksDB data directory, when it isn't the datadir's own .rocksdb/ (#rocksdb/ on MariaDB) - i.e. rocksdb_datadir pointed elsewhere")
+	rocksdbToInnoDB      = flag.Bool("rocksdb-to-innodb", false, "Write every MyRocks (ENGINE=ROCKSDB) table's DDL as ENGINE=InnoDB instead, without the index COMMENTs MyRocks uses for column family placement - for migrating MyRocks tables to InnoDB (and the only way MySQL Shell's util.loadDump() can load a --format=tsv dump of them: it loads at READ UNCOMMITTED, which MyRocks refuses). Row data is unchanged")
 	myisamToInnoDB       = flag.Bool("myisam-to-innodb", false, "Write every MyISAM table's DDL as ENGINE=InnoDB instead (adding a KEY for an AUTO_INCREMENT column InnoDB would otherwise reject), for migrating an old datadir's MyISAM tables to InnoDB on a new server - the row data itself is unchanged")
 )
 
@@ -99,8 +104,10 @@ func main() {
 	if *filePath == "" && *sourceDir == "" {
 		fmt.Printf("%s %s\n", appName, version)
 		fmt.Printf("Usage: %s --file /path/to/table.ibd [--out-dir DIR] [--table NAME] [--limit N]\n", appName)
+		fmt.Printf("       %s --file /path/to/datadir --table schema.table   (MyRocks)\n", strings.Repeat(" ", len(appName)))
 		fmt.Printf("       %s --source-dir /path/to/datadir [--out-dir DIR] [--limit N]\n", strings.Repeat(" ", len(appName)))
-		fmt.Println("       [--format sql|tsv] [--ddl-only] [--myisam-to-innodb] [--skip-corrupted] [--no-progress]")
+		fmt.Println("       [--format sql|tsv] [--ddl-only] [--myisam-to-innodb] [--rocksdb-to-innodb] [--skip-corrupted]")
+		fmt.Println("       [--rocksdb-dir DIR] [--rocksdb-index N] [--no-progress]")
 		fmt.Println("       [--verbose] [--yes] [--debug] [--dump-page N] [--version]")
 		os.Exit(1)
 	}
@@ -159,8 +166,12 @@ func run() error {
 	}
 	debugFields = *debug
 	convertMyISAMToInnoDB = *myisamToInnoDB
+	convertRocksDBToInnoDB = *rocksdbToInnoDB
 	initProgress(*noProgress)
 
+	if *rocksdbIndex != 0 && (*sourceDir != "" || *tableName == "") {
+		return fmt.Errorf("--rocksdb-index needs --file and --table: it names one table's index")
+	}
 	if *sourceDir != "" {
 		if *filePath != "" {
 			return fmt.Errorf("--source-dir cannot be combined with --file")
@@ -172,6 +183,9 @@ func run() error {
 			return fmt.Errorf("--dump-page requires --file, not --source-dir")
 		}
 		return runSourceDir()
+	}
+	if tgt, ok := isMyRocksFileArg(*filePath); ok {
+		return runMyRocksFile(tgt)
 	}
 	if isMyISAMDataFile(*filePath) {
 		return runMyISAMFile()
@@ -286,7 +300,15 @@ func writeSingleTable(t *Table, srcPath string, mysqlVersionID uint32, partition
 	}
 
 	printBanner()
-	fmt.Printf("%s %s (row_format=%s)\n", dim("Table:      "), id(t.SchemaRef+"."+t.Name), rowFormatName(t.RowFormat))
+	if t.Engine == "ROCKSDB" {
+		conv := ""
+		if convertRocksDBToInnoDB {
+			conv = ", DDL written as ENGINE=InnoDB (--rocksdb-to-innodb)"
+		}
+		fmt.Printf("%s %s (engine=ROCKSDB%s)\n", dim("Table:      "), id(t.SchemaRef+"."+t.Name), conv)
+	} else {
+		fmt.Printf("%s %s (row_format=%s)\n", dim("Table:      "), id(t.SchemaRef+"."+t.Name), rowFormatName(t.RowFormat))
+	}
 	if partitions != "" {
 		fmt.Printf("%s %s\n", dim("Partitions: "), partitions)
 	}
@@ -362,13 +384,16 @@ func writeSingleTable(t *Table, srcPath string, mysqlVersionID uint32, partition
 	rowNoun := "row(s)"
 	if *deletedOnly {
 		rowNoun = "delete-marked row(s)"
+		if t.Engine == "ROCKSDB" {
+			rowNoun = "deleted row(s)"
+		}
 	}
 	fmt.Printf("%s %s (%s %s written", dim("Data file:  "), id(dataPath), good(fmt.Sprintf("%d", nOK)), rowNoun)
 	if nErr > 0 {
 		fmt.Printf(", %s row(s) skipped - see warnings above", warn(fmt.Sprintf("%d", nErr)))
 	}
 	if nCorruptPages > 0 {
-		fmt.Printf(", %s corrupted page(s) skipped - see warnings above", bad(fmt.Sprintf("%d", nCorruptPages)))
+		fmt.Printf(", %s corrupted %s skipped - see warnings above", bad(fmt.Sprintf("%d", nCorruptPages)), t.corruptNoun())
 	}
 	fmt.Printf(")\n")
 	if truncated {
@@ -625,6 +650,10 @@ func writeSQLTable(rw RowWalker, srcPath, schemaPath, dataPath string, t *Table,
 		pr := newProg(fmt.Sprintf("decoding %s.%s", t.SchemaRef, t.Name), rw.ProgressTotal)
 		defer pr.finish()
 		onCorrupt := func(cp CorruptPage) {
+			if cp.Info {
+				pr.Warnf("%s %s: %s\n", warn("warning:"), t.corruptLabel(cp), cp.Reason)
+				return
+			}
 			nCorruptPages++
 			if cp.Truncated {
 				truncated = true
@@ -632,16 +661,16 @@ func writeSQLTable(rw RowWalker, srcPath, schemaPath, dataPath string, t *Table,
 			// pr.Warnf (not a plain Fprintf) clears the bar's own
 			// in-progress line first, so this can't land mid-redraw and
 			// splice into it - see progress.go.
-			pr.Warnf("%s corrupted %s: %s\n", warn("warning:"), t.corruptUnitLabel(cp.PageNo), cp.Reason)
+			pr.Warnf("%s corrupted %s: %s\n", warn("warning:"), t.corruptLabel(cp), cp.Reason)
 			fmt.Fprintf(bw, "-- skipped corrupted %s (table %s.%s): %s\n",
-				t.corruptUnitLabel(cp.PageNo), t.SchemaRef, t.Name, cp.Reason)
+				t.corruptLabel(cp), t.SchemaRef, t.Name, cp.Reason)
 		}
 		onRow := func(roe RowOrError) bool {
 			pr.set(roe.ProgressBase + int64(roe.PageNo))
 			if roe.Err != nil {
 				nErr++
-				pr.Warnf("%s %s: %v\n", warn("warning:"), t.corruptRowLabel(roe.PageNo, roe.RecOff), roe.Err)
-				fmt.Fprintf(bw, "-- skipped a row at %s: %v\n", t.corruptRowLabel(roe.PageNo, roe.RecOff), roe.Err)
+				pr.Warnf("%s %s: %v\n", warn("warning:"), t.rowLabel(roe), roe.Err)
+				fmt.Fprintf(bw, "-- skipped a row at %s: %v\n", t.rowLabel(roe), roe.Err)
 				return limitRows == 0 || nOK+nErr < limitRows
 			}
 			fmt.Fprintf(bw, "%s%s;\n", prefix, FormatRow(roe.Row))
@@ -674,6 +703,9 @@ func writeSQLTable(rw RowWalker, srcPath, schemaPath, dataPath string, t *Table,
 		// Table.AutoIncrementNext in schema.go); approximate it from the data.
 		if t.AutoIncrementCol != nil {
 			next := maxAutoInc + 1
+			if t.AutoIncrementStored > next {
+				next = t.AutoIncrementStored
+			}
 			t.AutoIncrementNext = &next
 		}
 	}
@@ -726,11 +758,20 @@ func runSourceDir() error {
 			"or pass --force-scan to scan %s exactly as given", *sourceDir, *sourceDir)
 	}
 
+	rocksDir := *rocksdbDir
+	if rocksDir == "" {
+		rocksDir = findRocksDBDir(*sourceDir)
+	}
+
 	printBanner()
+	also := ""
+	if rocksDir != "" {
+		also = fmt.Sprintf(", plus every MyRocks table (read from %s)", filepath.Base(rocksDir))
+	}
 	if safe {
-		fmt.Printf("Following %s recursively — recognized as %s, so every InnoDB table found inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) and every MyISAM table (.MYD files) will be dumped.\n", id(*sourceDir), kind)
+		fmt.Printf("Following %s recursively — recognized as %s, so every InnoDB table found inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) and every MyISAM table (.MYD files)%s will be dumped.\n", id(*sourceDir), kind, also)
 	} else {
-		fmt.Printf("Following %s recursively (--force-scan) — every InnoDB table found anywhere inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) and every MyISAM table (.MYD files) will be dumped.\n", id(*sourceDir))
+		fmt.Printf("Following %s recursively (--force-scan) — every InnoDB table found anywhere inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) and every MyISAM table (.MYD files)%s will be dumped.\n", id(*sourceDir), also)
 	}
 
 	dir := *outDir
@@ -763,6 +804,9 @@ func runSourceDir() error {
 			return err
 		}
 		if ent.IsDir() {
+			if rocksDir != "" && filepath.Clean(path) == filepath.Clean(rocksDir) {
+				return filepath.SkipDir // read as a whole below, not file by file
+			}
 			return nil
 		}
 		switch strings.ToLower(filepath.Ext(path)) {
@@ -820,12 +864,18 @@ func runSourceDir() error {
 	var sharedFRMs []string
 	for _, p := range frmFiles {
 		if !coveredBases[strings.TrimSuffix(p, filepath.Ext(p))] {
+			if rocksDir != "" {
+				// A MyRocks table's .frm: read with the RocksDB directory below.
+				if def, err := readFRMDefinition(p); err == nil && def.engineIsRocksDB() {
+					continue
+				}
+			}
 			sharedFRMs = append(sharedFRMs, p)
 		}
 	}
 
-	if len(ibdFiles) == 0 && len(sharedFRMs) == 0 && len(mydFiles) == 0 && len(partBases) == 0 {
-		return fmt.Errorf("no .ibd, .frm, or .MYD files found under %s", *sourceDir)
+	if len(ibdFiles) == 0 && len(sharedFRMs) == 0 && len(mydFiles) == 0 && len(partBases) == 0 && rocksDir == "" {
+		return fmt.Errorf("no .ibd, .frm, or .MYD files (or MyRocks .rocksdb directory) found under %s", *sourceDir)
 	}
 
 	srcMsg := fmt.Sprintf("%d .ibd file(s)", len(ibdFiles)+nPartFiles)
@@ -837,6 +887,9 @@ func runSourceDir() error {
 	}
 	if len(mydFiles) > 0 {
 		srcMsg += fmt.Sprintf(", %d MyISAM .MYD file(s)", len(mydFiles))
+	}
+	if rocksDir != "" {
+		srcMsg += fmt.Sprintf(", a MyRocks data directory (%s)", filepath.Base(rocksDir))
 	}
 	fmt.Printf("%s %s (%s found)\n", dim("Source:     "), id(*sourceDir), srcMsg)
 
@@ -923,6 +976,22 @@ func runSourceDir() error {
 		}
 	}
 
+	var nMRTables, nMRFailed int
+	var mrErr error
+	if rocksDir != "" {
+		var nt, nr, nre, nc, ns int
+		nt, nr, nre, nc, ns, nMRFailed, mrErr = extractMyRocksTables(rocksDir, *sourceDir, dir, d)
+		if mrErr != nil {
+			fmt.Fprintf(os.Stderr, "%s MyRocks (%s): %v\n", warn("warning:"), rocksDir, mrErr)
+		}
+		nMRTables = nt
+		nTables += nt
+		nRowsTotal += nr
+		nRowErrTotal += nre
+		nCorruptTotal += nc
+		nSkippedTotal += ns
+	}
+
 	if d != nil {
 		if err := d.Finish(); err != nil {
 			return fmt.Errorf("writing dump metadata: %w", err)
@@ -940,6 +1009,16 @@ func runSourceDir() error {
 		fmt.Printf("%s %s/%d MyISAM .MYD file(s) processed", dim("Files:      "), good(fmt.Sprintf("%d", nMydOK)), len(mydFiles))
 		if nMydErrs > 0 {
 			fmt.Printf(" (%s failed - see warnings above)", bad(fmt.Sprintf("%d", nMydErrs)))
+		}
+		fmt.Println()
+	}
+	if rocksDir != "" && mrErr == nil {
+		fmt.Printf("%s %s MyRocks table(s) extracted", dim("MyRocks:    "), good(fmt.Sprintf("%d", nMRTables)))
+		if nMRFailed > 0 {
+			fmt.Printf(" (%s failed - see warnings above)", bad(fmt.Sprintf("%d", nMRFailed)))
+		}
+		if convertRocksDBToInnoDB && nMRTables > 0 {
+			fmt.Printf(", written as ENGINE=InnoDB (--rocksdb-to-innodb)")
 		}
 		fmt.Println()
 	}
@@ -971,8 +1050,14 @@ func runSourceDir() error {
 		fmt.Printf("%s %d source file%s looked truncated (not fully copied) - recovered every row up to where each one ends; anything stored after that point is missing.\n",
 			warn("Note:       "), nTruncatedTotal, plural)
 	}
-	if nFileErrs > 0 || nMydErrs > 0 {
+	if nFileErrs > 0 || nMydErrs > 0 || nMRFailed > 0 || mrErr != nil {
 		var parts []string
+		if mrErr != nil {
+			parts = append(parts, "reading the MyRocks data directory")
+		}
+		if nMRFailed > 0 {
+			parts = append(parts, fmt.Sprintf("%d MyRocks table(s)", nMRFailed))
+		}
 		if nFileErrs > 0 {
 			parts = append(parts, fmt.Sprintf("%d of %d .ibd file(s)", nFileErrs, len(ibdFiles)+nPartFiles))
 		}
@@ -1211,13 +1296,16 @@ func writeAndSummarizeTable(t *Table, srcLabel, dir string, mysqlVersionID uint3
 		rowNoun := "row(s)"
 		if *deletedOnly {
 			rowNoun = "delete-marked row(s)"
+			if t.Engine == "ROCKSDB" {
+				rowNoun = "deleted row(s)"
+			}
 		}
 		fmt.Printf("%s %s", good(fmt.Sprintf("%d", tOK)), rowNoun)
 		if tErr > 0 {
 			fmt.Printf(", %s skipped", warn(fmt.Sprintf("%d", tErr)))
 		}
 		if tCorrupt > 0 {
-			fmt.Printf(", %s corrupted page(s) skipped", bad(fmt.Sprintf("%d", tCorrupt)))
+			fmt.Printf(", %s corrupted %s skipped", bad(fmt.Sprintf("%d", tCorrupt)), t.corruptNoun())
 		}
 		if tTruncated {
 			fmt.Printf(" %s", warn("[source file truncated]"))

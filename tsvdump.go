@@ -344,6 +344,10 @@ func (d *TSVDump) AddTable(rw RowWalker, t *Table, outCols []*Column, ddlOnly bo
 
 		pr := newProg(progressLabel, rw.ProgressTotal)
 		onCorrupt := func(cp CorruptPage) {
+			if cp.Info {
+				pr.Warnf("%s %s: %s\n", warn("warning:"), t.corruptLabel(cp), cp.Reason)
+				return
+			}
 			nCorruptPages++
 			if cp.Truncated {
 				truncated = true
@@ -351,13 +355,13 @@ func (d *TSVDump) AddTable(rw RowWalker, t *Table, outCols []*Column, ddlOnly bo
 			// pr.Warnf (not a plain Fprintf) clears the bar's own
 			// in-progress line first, so this can't land mid-redraw and
 			// splice into it - see progress.go.
-			pr.Warnf("%s corrupted %s: %s\n", warn("warning:"), t.corruptUnitLabel(cp.PageNo), cp.Reason)
+			pr.Warnf("%s corrupted %s: %s\n", warn("warning:"), t.corruptLabel(cp), cp.Reason)
 		}
 		onRow := func(roe RowOrError) bool {
 			pr.set(roe.ProgressBase + int64(roe.PageNo))
 			if roe.Err != nil {
 				nErr++
-				pr.Warnf("%s %s: %v\n", warn("warning:"), t.corruptRowLabel(roe.PageNo, roe.RecOff), roe.Err)
+				pr.Warnf("%s %s: %v\n", warn("warning:"), t.rowLabel(roe), roe.Err)
 				return limitRows == 0 || nOK+nErr < limitRows
 			}
 			line := strings.Join(roe.Row.Values, "\t") + "\n"
@@ -390,6 +394,9 @@ func (d *TSVDump) AddTable(rw RowWalker, t *Table, outCols []*Column, ddlOnly bo
 
 		if t.AutoIncrementCol != nil {
 			next := maxAutoInc + 1
+			if t.AutoIncrementStored > next {
+				next = t.AutoIncrementStored
+			}
 			t.AutoIncrementNext = &next
 			if err := writeTableDDL(); err != nil { // re-render now that AUTO_INCREMENT is known
 				return nOK, nErr, nCorruptPages, truncated, fmt.Errorf("rewriting %s.sql: %w", tableBasename, err)
