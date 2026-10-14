@@ -43,7 +43,6 @@ package main
 import (
 	"encoding/base64"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -767,7 +766,7 @@ func decodeMySQLFilename(name string) string {
 // definition this file knows how to read - but, unlike parseFRM, not
 // checking which storage engine it belongs to.
 func readFRMDefinition(path string) (*frmDefinition, error) {
-	data, err := os.ReadFile(path)
+	data, err := readSourceFile(path)
 	if err != nil {
 		return nil, err
 	}

@@ -517,7 +517,7 @@ func frmWrapPartitionClause(clause string) string {
 // word, a name-area length in bytes, then the NUL-separated names in
 // filename encoding ("p0", or "p0#SP#sp0" for a subpartition).
 func parsePARFile(path string) ([]string, error) {
-	data, err := os.ReadFile(path)
+	data, err := readSourceFile(path)
 	if err != nil {
 		return nil, err
 	}

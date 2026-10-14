@@ -224,7 +224,7 @@ func openRocksDB(dir string) (*rdbDB, error) {
 
 	// --- MANIFEST ---
 	manifest := ""
-	if cur, err := os.ReadFile(filepath.Join(dir, "CURRENT")); err == nil {
+	if cur, err := readSourceFile(filepath.Join(dir, "CURRENT")); err == nil {
 		name := strings.TrimSpace(string(cur))
 		if strings.HasPrefix(name, "MANIFEST-") && !strings.ContainsAny(name, "/\\") {
 			if _, err := os.Stat(filepath.Join(dir, name)); err == nil {

@@ -33,7 +33,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -84,7 +83,7 @@ type sstFile struct {
 	Path   string
 	Number uint64
 	Size   int64
-	f      *os.File
+	f      *srcFile
 
 	Legacy        bool // format_version 0 (legacy magic number)
 	FormatVersion uint32
@@ -125,7 +124,7 @@ type sstFile struct {
 // recorded in OpenErr (see sstFile), so the caller can still try to
 // salvage the file's data blocks.
 func openSST(path string) (*sstFile, error) {
-	f, err := os.Open(path)
+	f, err := openSource(path)
 	if err != nil {
 		return nil, err
 	}

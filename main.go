@@ -63,7 +63,7 @@ const appName = "innodump"
 // The hardcoded fallback below is what a plain "go build"/"go install"
 // (no ldflags) prints instead - kept in sync with the latest tagged
 // release by hand.
-var version = "0.8.0"
+var version = "0.8.1"
 
 var (
 	filePath             = flag.String("file", "", "Path to the .ibd file to extract - or, for a MyRocks table, the datadir (or its .rocksdb directory, or the table's .sdi/.frm), with --table")
@@ -79,6 +79,9 @@ var (
 	ddlOnly              = flag.Bool("ddl-only", false, "Only write the schema file(s); skip walking any table's data entirely")
 	deletedOnly          = flag.Bool("deleted-only", false, "Dump only deleted rows instead of live ones - both still delete-marked (not yet purged) and already purged but not yet overwritten (still on the page's own free list) - for forensic recovery of recently deleted data. The output data file name gets a \"-deleted\" suffix, so it never collides with a normal dump of the same table")
 	skipCorrupted        = flag.Bool("skip-corrupted", false, "On a corrupted leaf page, note it and try to carry on from the next page instead of stopping")
+	examine              = flag.Bool("examine", false, "Read-only health check of --file or --source-dir: decode every table and row as an extraction would, write nothing, and summarize what's there (tables per engine, rows) and what's wrong (damaged pages/blocks, undecodable rows, unreadable files); exits non-zero if anything is")
+	directIO             = flag.Bool("direct-io", false, "Keep source and output files out of the OS page cache: read with O_DIRECT (F_NOCACHE on macOS), and flush+drop output as it's written - for extracting on a busy host without evicting the server's cached data (see the README's \"I/O control\")")
+	ioLimit              = flag.String("io-limit", "", "Cap this run's disk I/O - source reads and output writes together - at RATE bytes per second, e.g. 50M (K/M/G suffixes; default: unlimited)")
 	noProgress           = flag.Bool("no-progress", false, "Never draw the progress bar on stderr (also honored: NO_PROGRESS=1)")
 	verbose              = flag.Bool("verbose", false, "Print extra .ibd/table details: page size, FSP flags, the MySQL version and dictionary/SDI versions that wrote the file, index/column counts")
 	yes                  = flag.Bool("yes", false, "Overwrite existing output files without prompting (also honored: YES=1)")
@@ -107,7 +110,7 @@ func main() {
 		fmt.Printf("       %s --file /path/to/datadir --table schema.table   (MyRocks)\n", strings.Repeat(" ", len(appName)))
 		fmt.Printf("       %s --source-dir /path/to/datadir [--out-dir DIR] [--limit N]\n", strings.Repeat(" ", len(appName)))
 		fmt.Println("       [--format sql|tsv] [--ddl-only] [--myisam-to-innodb] [--rocksdb-to-innodb] [--skip-corrupted]")
-		fmt.Println("       [--rocksdb-dir DIR] [--rocksdb-index N] [--no-progress]")
+		fmt.Println("       [--rocksdb-dir DIR] [--rocksdb-index N] [--direct-io] [--io-limit RATE] [--examine] [--no-progress]")
 		fmt.Println("       [--verbose] [--yes] [--debug] [--dump-page N] [--version]")
 		os.Exit(1)
 	}
@@ -163,6 +166,15 @@ func run() error {
 	}
 	if *compressLevel < 1 || *compressLevel > 22 {
 		return fmt.Errorf("--compression-level must be between 1 and 22, not %d", *compressLevel)
+	}
+	if err := initIO(*directIO, *ioLimit); err != nil {
+		return err
+	}
+	if *examine {
+		examineMode = true
+		if err := examineGuard(); err != nil {
+			return err
+		}
 	}
 	debugFields = *debug
 	convertMyISAMToInnoDB = *myisamToInnoDB
@@ -314,6 +326,10 @@ func writeSingleTable(t *Table, srcPath string, mysqlVersionID uint32, partition
 	}
 	fmt.Printf("%s %d output (%d total incl. system/hidden)\n", dim("Columns:    "), len(outCols), len(t.Columns))
 
+	if examineMode {
+		examineTable(t, makeWalker)
+		return examineSingle()
+	}
 	if *format == "tsv" {
 		ck, _ := parseCompressionKind(*compression) // already validated in run()
 		dir := *outDir
@@ -508,6 +524,12 @@ func runMyISAMFile() error {
 	}
 	fmt.Printf("%s %d output (%d total incl. hidden)\n", dim("Columns:    "), len(outCols), len(t.Columns))
 
+	if examineMode {
+		examineTable(t, func(outCols []*Column, format outputFormat) RowWalker {
+			return myisamRowWalker(mydPath, t, layout, outCols, format, *skipCorrupted)
+		})
+		return examineSingle()
+	}
 	if *format == "tsv" {
 		ck, _ := parseCompressionKind(*compression) // already validated in run()
 		dir := *outDir
@@ -628,7 +650,7 @@ func writeSQLTable(rw RowWalker, srcPath, schemaPath, dataPath string, t *Table,
 			}
 		}
 
-		f, ferr := os.Create(dataPath)
+		f, ferr := createOutput(dataPath)
 		if ferr != nil {
 			return 0, 0, 0, false, fmt.Errorf("writing %s: %w", dataPath, ferr)
 		}
@@ -710,7 +732,7 @@ func writeSQLTable(rw RowWalker, srcPath, schemaPath, dataPath string, t *Table,
 		}
 	}
 
-	if err := os.WriteFile(schemaPath, []byte(GenerateDDL(t)), 0644); err != nil {
+	if err := writeOutputFile(schemaPath, []byte(GenerateDDL(t))); err != nil {
 		return nOK, nErr, nCorruptPages, truncated, fmt.Errorf("writing %s: %w", schemaPath, err)
 	}
 	return nOK, nErr, nCorruptPages, truncated, nil
@@ -768,10 +790,14 @@ func runSourceDir() error {
 	if rocksDir != "" {
 		also = fmt.Sprintf(", plus every MyRocks table (read from %s)", filepath.Base(rocksDir))
 	}
+	verb := "dumped"
+	if examineMode {
+		verb = "examined (nothing is written)"
+	}
 	if safe {
-		fmt.Printf("Following %s recursively — recognized as %s, so every InnoDB table found inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) and every MyISAM table (.MYD files)%s will be dumped.\n", id(*sourceDir), kind, also)
+		fmt.Printf("Following %s recursively — recognized as %s, so every InnoDB table found inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) and every MyISAM table (.MYD files)%s will be %s.\n", id(*sourceDir), kind, also, verb)
 	} else {
-		fmt.Printf("Following %s recursively (--force-scan) — every InnoDB table found anywhere inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) and every MyISAM table (.MYD files)%s will be dumped.\n", id(*sourceDir), also)
+		fmt.Printf("Following %s recursively (--force-scan) — every InnoDB table found anywhere inside (file-per-table .ibd files, plus any table found only in ibdata1's own shared tablespace) and every MyISAM table (.MYD files)%s will be %s.\n", id(*sourceDir), also, verb)
 	}
 
 	dir := *outDir
@@ -780,7 +806,9 @@ func runSourceDir() error {
 	}
 
 	var d *TSVDump
-	if *format == "tsv" {
+	if examineMode {
+		// Nothing is written.
+	} else if *format == "tsv" {
 		if err := confirmOverwriteDir(dir, *yes || os.Getenv("YES") != ""); err != nil {
 			return err
 		}
@@ -904,7 +932,10 @@ func runSourceDir() error {
 		nSkippedTotal += ns
 		if err != nil {
 			nFileErrs++
-			fmt.Fprintf(os.Stderr, "%s %s: %v\n", warn("warning:"), path, err)
+			if !examineMode {
+				fmt.Fprintf(os.Stderr, "%s %s: %v\n", warn("warning:"), path, err)
+			}
+			examineFailure(path, "InnoDB", err)
 			continue
 		}
 		nFilesOK++
@@ -921,7 +952,10 @@ func runSourceDir() error {
 		nSkippedTotal += ns
 		if err != nil {
 			nFileErrs += len(files)
-			fmt.Fprintf(os.Stderr, "%s %s (partitioned table, %d partition file(s)): %v\n", warn("warning:"), base, len(files), err)
+			if !examineMode {
+				fmt.Fprintf(os.Stderr, "%s %s (partitioned table, %d partition file(s)): %v\n", warn("warning:"), base, len(files), err)
+			}
+			examineFailure(base, "InnoDB", err)
 			continue
 		}
 		nFilesOK += len(files)
@@ -944,7 +978,10 @@ func runSourceDir() error {
 		nSkippedTotal += ns
 		if err != nil {
 			nMydErrs++
-			fmt.Fprintf(os.Stderr, "%s %s: %v\n", warn("warning:"), path, err)
+			if !examineMode {
+				fmt.Fprintf(os.Stderr, "%s %s: %v\n", warn("warning:"), path, err)
+			}
+			examineFailure(path, "MyISAM", err)
 			continue
 		}
 		nMydOK++
@@ -982,7 +1019,10 @@ func runSourceDir() error {
 		var nt, nr, nre, nc, ns int
 		nt, nr, nre, nc, ns, nMRFailed, mrErr = extractMyRocksTables(rocksDir, *sourceDir, dir, d)
 		if mrErr != nil {
-			fmt.Fprintf(os.Stderr, "%s MyRocks (%s): %v\n", warn("warning:"), rocksDir, mrErr)
+			if !examineMode {
+				fmt.Fprintf(os.Stderr, "%s MyRocks (%s): %v\n", warn("warning:"), rocksDir, mrErr)
+			}
+			examineFailure(rocksDir, "ROCKSDB", mrErr)
 		}
 		nMRTables = nt
 		nTables += nt
@@ -992,6 +1032,13 @@ func runSourceDir() error {
 		nSkippedTotal += ns
 	}
 
+	if examineMode {
+		var notes []string
+		if nNotFoundTotal > 0 {
+			notes = append(notes, fmt.Sprintf("%d .frm file(s) with no matching .ibd had no InnoDB entry in ibdata1's own dictionary either - likely non-InnoDB tables, VIEWs, or a general tablespace - not examined", nNotFoundTotal))
+		}
+		return finishExamine(notes)
+	}
 	if d != nil {
 		if err := d.Finish(); err != nil {
 			return fmt.Errorf("writing dump metadata: %w", err)
@@ -1237,7 +1284,10 @@ func processTable(sp *Space, srcLabel, dir string, target *ddTableJSON, mysqlVer
 	}
 	t, berr := BuildTable(target)
 	if berr != nil {
-		fmt.Fprintf(os.Stderr, "%s %s: table %q: %v\n", warn("warning:"), srcLabel, target.Name, berr)
+		if !examineMode {
+			fmt.Fprintf(os.Stderr, "%s %s: table %q: %v\n", warn("warning:"), srcLabel, target.Name, berr)
+		}
+		examineFailure(target.SchemaRef+"."+target.Name, "InnoDB", berr)
 		return false, 0, 0, 0, false, false
 	}
 	ok, tOK, tErr, tCorrupt, tTruncated = writeAndSummarizeTable(t, srcLabel, dir, mysqlVersionID, tsvDump,
@@ -1257,6 +1307,10 @@ func processTable(sp *Space, srcLabel, dir string, target *ddTableJSON, mysqlVer
 // and the target format (sql vs tsv) are known.
 func writeAndSummarizeTable(t *Table, srcLabel, dir string, mysqlVersionID uint32, tsvDump *TSVDump,
 	makeWalker func(outCols []*Column, format outputFormat) RowWalker) (ok bool, tOK, tErr, tCorrupt int, tTruncated bool) {
+	if examineMode {
+		e := examineTable(t, makeWalker)
+		return e.Failed == nil, e.Rows, e.RowErrs, e.Corrupt, e.Truncated
+	}
 	outCols := OutputColumns(t)
 	if len(outCols) == 0 {
 		fmt.Fprintf(os.Stderr, "%s %s: table %q has no columns this tool can output\n", warn("warning:"), srcLabel, t.Name)
@@ -1336,7 +1390,10 @@ func extractSharedFRMTables(sp *Space, ibdataPath, dir string, frmPaths []string
 		}
 		target, err := parseFRM(frmPath, sp, loc)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "%s %s: %v\n", warn("warning:"), frmPath, err)
+			if !examineMode {
+				fmt.Fprintf(os.Stderr, "%s %s: %v\n", warn("warning:"), frmPath, err)
+			}
+			examineFailure(frmPath, "InnoDB", err)
 			continue
 		}
 		ok, tOK, tErr, tCorrupt, tTruncated, skippedSystem := processTable(sp, ibdataPath, dir, target, 0, tsvDump)

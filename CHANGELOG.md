@@ -1,5 +1,28 @@
 ## Unreleased
 
+## 0.8.1	13-Oct-2026
+
+## NEW FEATURES
+
+* `--examine`: a read-only health check of a datadir (`--source-dir`) or a
+  single table (`--file`). Every table is read and every row decoded
+  exactly as an extraction would, but nothing is written; it carries on
+  past damage to count all of it. One line per table (engine, rows, OK /
+  DAMAGED / UNREADABLE), then a summary per engine and a list of every
+  table with problems and the first problem found; exits non-zero if
+  there are any. `--verbose` lists every damaged page/block and row.
+* `--direct-io` and `--io-limit RATE`, for extracting next to a busy server
+  without page-cache pressure or saturating its disks: source files are
+  read with `O_DIRECT` (`F_NOCACHE` on macOS; `POSIX_FADV_DONTNEED` where
+  the filesystem refuses `O_DIRECT`), output is flushed and dropped from
+  the cache as it's written, and a token bucket caps the bytes read and
+  written per second. Applies to every source and output file.
+
+## BUGS FIXED
+
+* A tablespace whose page 0 is blank was reported as "no SDI (a pre-8.0
+  file)"; it's now reported as a damaged tablespace header.
+
 ## 0.8.0	13-Oct-2026
 
 ## NEW FEATURES

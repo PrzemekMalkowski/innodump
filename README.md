@@ -33,7 +33,9 @@ records them, not after the source file - `mysql.ibd`'s `user` table gives
 `mysql.user-schema.sql`.
 
 `--format tsv` writes a MySQL Shell `util.loadDump()`-compatible dump
-directory instead (see "TSV output"). `--source-dir DIR` extracts every
+directory instead (see "TSV output"). `--examine` writes nothing at all:
+it checks every table and row and reports what it found (see "Examining a
+datadir"). `--source-dir DIR` extracts every
 table in a datadir or database directory, InnoDB, MyISAM and MyRocks
 alike, into one combined dump (see "Bulk extraction").
 
@@ -175,6 +177,9 @@ innodump --file /path/to/table.ibd [options]
 | `--deleted-only` | Dump only deleted rows that are still recoverable - delete-marked, purged-but-not-overwritten, or on freed pages (for MyRocks: rows whose deletion hasn't been compacted away yet) - instead of live rows (see "Recovering deleted rows"). The data file gets a `-deleted` suffix. |
 | `--yes` | Overwrite existing output without asking (also `YES=1`). Otherwise an existing output file triggers a y/N prompt, or a refusal when there's no terminal; for `tsv` only the dump's `@.json` is checked. |
 | `--skip-corrupted` | On a corrupted page or record, note it and carry on where possible instead of stopping. |
+| `--examine` | Read-only check: read every table and decode every row as an extraction would, write nothing, and summarize tables, engines, row counts and damage; exits non-zero if anything is damaged or unreadable (see "Examining a datadir"). |
+| `--direct-io` | Keep source and output files out of the OS page cache (`O_DIRECT` reads; output flushed and dropped as it's written) - see "I/O control". |
+| `--io-limit RATE` | Cap the run's disk I/O - source reads and output writes together - at RATE bytes per second, e.g. `50M` (`K`/`M`/`G` suffixes). |
 | `--no-progress` | Never draw the progress bar (also `NO_PROGRESS=1`). |
 | `--verbose` | Print file/table details: page size, FSP flags, the MySQL and dictionary/SDI versions that wrote the file, index/column counts. Single `--file` only. |
 | `--debug` | Print each record's decoded field byte-ranges. |
@@ -1043,6 +1048,82 @@ Decoding rows and rendering them as SQL or TSV runs in parallel across
 `GOMAXPROCS` cores, in batches of pages, and the results are written in the
 original order through a buffered writer (see `btree.go`'s `WalkRows` and
 `decodeBatch`).
+
+## Examining a datadir (`--examine`)
+
+`--examine` answers "what's in here, and is it all readable?" without
+writing anything. It goes through exactly what an extraction would - every
+table found (InnoDB, MyISAM, MyRocks), every row decoded and rendered - but
+writes no files and creates no output directory, and it always carries on
+past damage (as `--skip-corrupted` does) so that everything wrong is
+counted, not just the first problem. It works on `--source-dir` (a whole
+datadir or database directory) and on a single `--file`.
+
+```
+$ innodump --source-dir /data/copy/sbtest --examine
+  sbtest.sbtest1                           InnoDB    10000 row(s)  OK  [COMPRESSION=LZ4]
+  sbtest.sbtest2                           InnoDB     8614 row(s)  DAMAGED (1 damaged page(s), source file truncated)  [COMPRESSION=LZ4]
+  sbtest3.ibd                              InnoDB                  UNREADABLE: page 0 (the tablespace header, which records its page size, flags and SDI) is blank - the file is damaged there, so its layout can't be determined
+  sbtest.sbtest4                           InnoDB     9854 row(s)  DAMAGED (2 damaged page(s))
+
+Summary
+  InnoDB       4 table(s), 28468 row(s), 3 with problems
+  total        4 table(s), 28468 row(s)
+Result:      3 table(s) or file(s) with problems:
+  sbtest.sbtest2: page 150 (index "PRIMARY", id 167): page 150 is past the end of the file (it holds only 150 page(s)) - the file looks truncated (not fully copied), rather than corrupted
+  sbtest3.ibd: page 0 (the tablespace header, which records its page size, flags and SDI) is blank - the file is damaged there, so its layout can't be determined
+  sbtest.sbtest4: page 16 (index "PRIMARY", id 173): checksum mismatch (stored e1b825dc/e1b825dc, computed crc32c 7c6f03e9, legacy innodb ab4c97f2/3a0ca90d)
+```
+
+Each table gets one line: its engine, how many rows decoded, and a status -
+`OK`, `DAMAGED` (damaged pages, RocksDB blocks or MyISAM records, rows that
+wouldn't decode, a truncated source file) or `UNREADABLE` (nothing could be
+read: no schema file, an unsupported format, a destroyed header). Notable
+table properties follow in brackets (a non-default row format, page
+compression, partitioning). The summary counts tables and rows per engine
+and lists every table with a problem, with the first problem found;
+`--verbose` also prints every damaged page/block and row as it's met.
+
+The exit code is non-zero when anything is damaged or unreadable, so it can
+gate a script - e.g. check a backup copy before relying on it. System
+schemas are included (unlike `--format=tsv`'s default), `--limit` caps the
+rows read per table, `--deleted-only` counts recoverable deleted rows
+instead, and `--direct-io`/`--io-limit` apply as usual.
+
+## I/O control (`--direct-io`, `--io-limit`)
+
+For extracting on a busy host - say, copying a large datadir's tables out
+for staging next to a running server - two options keep `innodump` from
+getting in the server's way:
+
+- `--direct-io` keeps both sides out of the OS page cache, so a big
+  extraction doesn't evict the server's cached data. Source files are read
+  with `O_DIRECT` (`F_NOCACHE` on macOS); reads are widened to 4KB-aligned
+  boundaries, with a 1MB read-ahead only while access is sequential, so a
+  random page read stays one small read. Output files are flushed and
+  dropped from the cache (`fdatasync` + `POSIX_FADV_DONTNEED`) every 16MB as
+  they're written. A filesystem that refuses `O_DIRECT` gets ordinary reads
+  followed by `POSIX_FADV_DONTNEED`, with a note saying so.
+- `--io-limit RATE` caps the bytes per second the run reads and writes, all
+  files together (a token bucket with a tenth of a second's burst) - e.g.
+  `--io-limit 50M`. It counts what actually hits the disk: aligned
+  `O_DIRECT` reads, compressed output with `--compression=zstd`.
+
+They apply to every file the tool touches: tablespaces, MyISAM files,
+`.frm`/`.sdi`, RocksDB SST files, WALs and MANIFEST, binlogs, and every
+output file.
+
+```
+$ innodump --source-dir /var/lib/mysql/employees --direct-io --io-limit 50M
+```
+
+Measured on the `employees` sample database (178MB of tablespaces, 486MB
+of SQL output, 3.9M rows): a normal run left 142MB of source and all 486MB
+of output in the page cache; with `--direct-io`, none of either, in 10%
+more time (2.6s vs 2.35s). With `--io-limit 50M` added, the run held
+50-51MB/s throughout and took 13.1s. Output is byte-for-byte the same with
+or without either option (checked on every test datadir, InnoDB, MyISAM and
+MyRocks, including SST salvage).
 
 ## Progress
 

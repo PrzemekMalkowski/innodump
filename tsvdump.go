@@ -179,7 +179,7 @@ func writeJSONFile(path string, v any) error {
 		return err
 	}
 	data = append(data, '\n')
-	return os.WriteFile(path, data, 0644)
+	return writeOutputFile(path, data)
 }
 
 // tsvSchemaState is one schema's accumulated bookkeeping across every table
@@ -278,7 +278,7 @@ func (d *TSVDump) ensureSchema(schema string) (*tsvSchemaState, error) {
 	d.schemaOrder = append(d.schemaOrder, schema)
 
 	ddl := fmt.Sprintf("CREATE DATABASE IF NOT EXISTS %s;\n", backquote(schema))
-	if err := os.WriteFile(filepath.Join(d.dir, s.basename+".sql"), []byte(ddl), 0644); err != nil {
+	if err := writeOutputFile(filepath.Join(d.dir, s.basename+".sql"), []byte(ddl)); err != nil {
 		return nil, fmt.Errorf("writing %s.sql: %w", s.basename, err)
 	}
 	return s, nil
@@ -314,7 +314,7 @@ func (d *TSVDump) AddTable(rw RowWalker, t *Table, outCols []*Column, ddlOnly bo
 	schemaState.tableBasenames[t.Name] = tableBasename
 
 	writeTableDDL := func() error {
-		return os.WriteFile(filepath.Join(d.dir, tableBasename+".sql"), []byte(GenerateDDL(t)), 0644)
+		return writeOutputFile(filepath.Join(d.dir, tableBasename+".sql"), []byte(GenerateDDL(t)))
 	}
 	if err := writeTableDDL(); err != nil {
 		return 0, 0, 0, false, fmt.Errorf("writing %s.sql: %w", tableBasename, err)
@@ -324,7 +324,7 @@ func (d *TSVDump) AddTable(rw RowWalker, t *Table, outCols []*Column, ddlOnly bo
 	var dataBytes uint64
 	if !ddlOnly {
 		dataPath := filepath.Join(d.dir, tableBasename+"."+ext)
-		f, ferr := os.Create(dataPath)
+		f, ferr := createOutput(dataPath)
 		if ferr != nil {
 			return 0, 0, 0, false, fmt.Errorf("writing %s: %w", dataPath, ferr)
 		}

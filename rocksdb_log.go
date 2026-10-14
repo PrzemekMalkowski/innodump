@@ -15,7 +15,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"os"
 )
 
 const (
@@ -57,7 +56,7 @@ type logProblem struct {
 // bad record doesn't hide everything after it; each such skip is returned
 // in problems.
 func readLogFile(path string, logNumber uint64) (recs []logRecord, problems []logProblem, err error) {
-	data, err := os.ReadFile(path)
+	data, err := readSourceFile(path)
 	if err != nil {
 		return nil, nil, err
 	}

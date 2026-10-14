@@ -22,7 +22,6 @@ import (
 	"compress/flate"
 	"encoding/binary"
 	"fmt"
-	"os"
 	"sort"
 )
 
@@ -66,7 +65,7 @@ func (db *rdbDB) salvageSST(ref *rdbSSTRef, why error) []rdbEntry {
 	ref.salvageDone = true
 	s := ref.sst
 	issue := func(is salvageIssue) { ref.salvageIssues = append(ref.salvageIssues, is) }
-	data, err := os.ReadFile(s.Path)
+	data, err := readSourceFile(s.Path)
 	if err != nil {
 		issue(salvageIssue{Global: true, Reason: fmt.Sprintf("can't use the file's index (%v) and can't read it for salvaging: %v", why, err)})
 		return nil

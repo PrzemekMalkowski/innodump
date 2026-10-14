@@ -450,7 +450,10 @@ func extractMyRocksTables(rocksDir, datadir, outDir string, tsvDump *TSVDump) (n
 		t, lays, versionID, _, err := prepareMyRocksTable(db, dict, datadir, lt)
 		if err != nil {
 			nFailed++
-			fmt.Fprintf(os.Stderr, "%s MyRocks table %s: %v\n", warn("warning:"), lt.fullName(), err)
+			if !examineMode {
+				fmt.Fprintf(os.Stderr, "%s MyRocks table %s: %v\n", warn("warning:"), lt.fullName(), err)
+			}
+			examineFailure(lt.fullName(), "ROCKSDB", err)
 			continue
 		}
 		ok, tOK, tErr, tCorrupt, _ := writeAndSummarizeTable(t, rocksDir, outDir, versionID, tsvDump,

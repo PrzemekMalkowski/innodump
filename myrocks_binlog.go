@@ -64,7 +64,7 @@ func findBinlogs(datadir string) []string {
 	}
 	idx, _ := filepath.Glob(filepath.Join(datadir, "*.index"))
 	for _, ix := range idx {
-		data, err := os.ReadFile(ix)
+		data, err := readSourceFile(ix)
 		if err != nil {
 			continue
 		}
@@ -95,7 +95,7 @@ func findBinlogs(datadir string) []string {
 }
 
 func isBinlogFile(p string) bool {
-	f, err := os.Open(p)
+	f, err := openSource(p)
 	if err != nil {
 		return false
 	}
@@ -123,7 +123,7 @@ func binlogXIDs(files []string) (xids map[uint64]bool, compressed int, err error
 }
 
 func scanBinlogXIDs(path string, xids map[uint64]bool) (compressed int, err error) {
-	f, err := os.Open(path)
+	f, err := openSource(path)
 	if err != nil {
 		return 0, err
 	}

@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
-	"os"
 )
 
 // FIL header offsets (relative to the start of a page).
@@ -186,7 +185,7 @@ func xdesSize(pageSize uint32) uint32 {
 // size") and PhysPageSize (the smaller zip_size actually on disk) differ;
 // for an uncompressed one they're the same value. See zipdecompress.go.
 type Space struct {
-	f            *os.File
+	f            *srcFile
 	PageSize     uint32 // logical page size
 	PhysPageSize uint32 // on-disk page size (== PageSize unless Compressed)
 	Compressed   bool
@@ -200,7 +199,7 @@ type Space struct {
 // page 0. Returns an error for encrypted/temporary tablespaces, which v1
 // does not support.
 func OpenSpace(path string) (*Space, error) {
-	f, err := os.Open(path)
+	f, err := openSource(path)
 	if err != nil {
 		return nil, err
 	}
@@ -215,6 +214,10 @@ func OpenSpace(path string) (*Space, error) {
 	if _, err := f.ReadAt(head, 0); err != nil {
 		f.Close()
 		return nil, fmt.Errorf("reading page 0 header: %w", err)
+	}
+	if blank := bytes.Count(head, []byte{0}) == len(head); blank && fi.Size() > 0 {
+		f.Close()
+		return nil, fmt.Errorf("page 0 (the tablespace header, which records its page size, flags and SDI) is blank - the file is damaged there, so its layout can't be determined")
 	}
 	rawFlags := binary.BigEndian.Uint32(head[fspHeaderOffset+fspSpaceFlags:])
 	flags := parseFSPFlags(rawFlags)

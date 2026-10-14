@@ -139,7 +139,7 @@ func findStandaloneSDI(dir, base string) (string, error) {
 // loadStandaloneSDI reads and parses one standalone .sdi file into the same
 // ddTableJSON model schema.go's embedded-SDI path builds.
 func loadStandaloneSDI(path string) (*ddTableJSON, uint32, error) {
-	data, err := os.ReadFile(path)
+	data, err := readSourceFile(path)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -274,7 +274,7 @@ const (
 // definitions (uniques MI_UNIQUEDEF + unique_key_parts HA_KEYSEG) that
 // follow the base info block - ending exactly at header_length. Returns
 // nil if the counts in head don't line up that way.
-func readMYIColumns(f *os.File, head []byte, basePos int64, fields uint32) []miColumnDef {
+func readMYIColumns(f *srcFile, head []byte, basePos int64, fields uint32) []miColumnDef {
 	headerLen := int64(miBEUint(head[6:8]))
 	baseInfoLen := int64(miBEUint(head[10:12]))
 	keyParts := int64(miBEUint(head[14:16]))
@@ -307,9 +307,9 @@ func readMYIColumns(f *os.File, head []byte, basePos int64, fields uint32) []miC
 // here is required (see this file's package comment).
 func readMYIHeader(mydPath string) (myiHeader, bool) {
 	myiPath := strings.TrimSuffix(mydPath, filepath.Ext(mydPath)) + ".MYI"
-	f, err := os.Open(myiPath)
+	f, err := openSource(myiPath)
 	if err != nil {
-		if f, err = os.Open(strings.TrimSuffix(mydPath, filepath.Ext(mydPath)) + ".myi"); err != nil {
+		if f, err = openSource(strings.TrimSuffix(mydPath, filepath.Ext(mydPath)) + ".myi"); err != nil {
 			return myiHeader{}, false
 		}
 	}
@@ -1137,7 +1137,7 @@ const maxMyISAMBlockChain = 1 << 20
 // for a MyISAM data file over 4GB), and RecOff is always 0.
 func WalkMyISAMRows(mydPath string, t *Table, lay *myisamLayout, outCols []*Column, format outputFormat,
 	skipCorrupted bool, onCorrupt func(CorruptPage), fn func(RowOrError) bool) error {
-	f, err := os.Open(mydPath)
+	f, err := openSource(mydPath)
 	if err != nil {
 		return err
 	}
@@ -1169,7 +1169,7 @@ func WalkMyISAMRows(mydPath string, t *Table, lay *myisamLayout, outCols []*Colu
 // lay.SlotLength-byte slot per record, sequentially from offset 0, with a
 // deleted slot marked by a leading zero byte (mirrors
 // _mi_read_rnd_static_record's own `if (!*record)` check in mi_statrec.c).
-func scanMyISAMFixed(f *os.File, size int64, lay *myisamLayout, skipCorrupted bool,
+func scanMyISAMFixed(f *srcFile, size int64, lay *myisamLayout, skipCorrupted bool,
 	decode func(*myisamRecord, int64) RowOrError, onCorrupt func(CorruptPage), fn func(RowOrError) bool) error {
 	if lay.SlotLength == 0 {
 		return fmt.Errorf("table has a zero-length record - nothing to scan")
@@ -1214,7 +1214,7 @@ func scanMyISAMFixed(f *os.File, size int64, lay *myisamLayout, skipCorrupted bo
 // position whose header parses as a plausible record start, silently
 // skipping the bytes in between rather than reporting one warning per
 // failed alignment step.
-func scanMyISAMDynamic(f *os.File, size int64, lay *myisamLayout, skipCorrupted bool,
+func scanMyISAMDynamic(f *srcFile, size int64, lay *myisamLayout, skipCorrupted bool,
 	decode func(*myisamRecord, int64) RowOrError, onCorrupt func(CorruptPage), fn func(RowOrError) bool) error {
 	header := make([]byte, miBlockHeaderLen)
 	pos := int64(0)
