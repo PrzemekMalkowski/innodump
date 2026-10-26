@@ -6,8 +6,11 @@
 package main
 
 import (
+	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // OutputColumns returns t's columns in CREATE TABLE order, restricted to
@@ -75,20 +78,21 @@ func columnHasCharset(ddType uint32) bool {
 // column types (straight from the SDI's own column_type_utf8, so these are
 // exact) plus NULL-ability, a column's own CHARACTER SET/COLLATE where SHOW
 // CREATE TABLE itself would show one (see resolveCollation/
-// columnHasCharset), AUTO_INCREMENT, comments, generated-column
-// expressions, the PRIMARY KEY, secondary indexes, FOREIGN KEY constraints,
-// and the table's default charset/collation and AUTO_INCREMENT counter -
-// but deliberately not DEFAULT clauses or other table options, which need
-// more of the SDI than v1 parses (or, for AUTO_INCREMENT, aren't in the SDI
-// at all - see Table.AutoIncrementNext's comment in schema.go). See the
+// columnHasCharset), DEFAULT/ON UPDATE clauses (columnDefaultClause),
+// AUTO_INCREMENT, comments, generated-column expressions, the PRIMARY KEY,
+// secondary indexes, FOREIGN KEY constraints, and the table's default
+// charset/collation and AUTO_INCREMENT counter - but deliberately not other
+// table options, which need more of the SDI than v1 parses (or, for
+// AUTO_INCREMENT, aren't in the SDI at all - see Table.AutoIncrementNext's
+// comment in schema.go). See the
 // tool's README/--help for the full list.
 func GenerateDDL(t *Table) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "-- Reconstructed by %s from the table's own dictionary information (SDI/.frm).\n", appName)
-	fmt.Fprintf(&b, "-- Best-effort DDL: column types, NULL-ability, AUTO_INCREMENT, comments,\n")
-	fmt.Fprintf(&b, "-- generated columns, the PRIMARY KEY, secondary indexes, FOREIGN KEY\n")
-	fmt.Fprintf(&b, "-- constraints, and the default charset/collation are reproduced; DEFAULT\n")
-	fmt.Fprintf(&b, "-- clauses and other table options are not. AUTO_INCREMENT (if any) is\n")
+	fmt.Fprintf(&b, "-- Best-effort DDL: column types, NULL-ability, DEFAULT/ON UPDATE clauses,\n")
+	fmt.Fprintf(&b, "-- AUTO_INCREMENT, comments, generated columns, the PRIMARY KEY, secondary\n")
+	fmt.Fprintf(&b, "-- indexes, FOREIGN KEY constraints, and the default charset/collation are\n")
+	fmt.Fprintf(&b, "-- reproduced; other table options are not. AUTO_INCREMENT (if any) is\n")
 	if t.Engine == "ROCKSDB" {
 		fmt.Fprintf(&b, "-- MyRocks' own persisted counter, or the highest value seen in the data\n")
 		fmt.Fprintf(&b, "-- plus one if that's higher.\n")
@@ -125,7 +129,9 @@ func GenerateDDL(t *Table) string {
 
 	var lines []string
 	for _, c := range t.Columns {
-		if c.IsSystem || c.Hidden == hiddenSE {
+		if c.IsSystem || c.Hidden == hiddenSE || c.Hidden == hiddenSQL {
+			// hiddenSQL: a functional index's own generated column, which
+			// the index's key part spells out instead (secondaryIndexColumnList).
 			continue
 		}
 		var l strings.Builder
@@ -175,8 +181,19 @@ func GenerateDDL(t *Table) string {
 			// and every NULL loaded into it turns into the load time.
 			l.WriteString(" NULL")
 		}
+		if c.HasSRID {
+			// Right after NULL-ability and before DEFAULT, as SHOW CREATE
+			// TABLE writes it (`p` point /*!80003 SRID 0 */ DEFAULT NULL).
+			fmt.Fprintf(&l, " /*!80003 SRID %d */", c.SRID)
+		}
+		l.WriteString(columnDefaultClause(c))
 		if c.IsAutoIncrement {
 			l.WriteString(" AUTO_INCREMENT")
+		}
+		if c.Hidden == hiddenUser {
+			// Versioned like SHOW CREATE TABLE writes it, so a pre-8.0.23
+			// server still creates the column, just visible.
+			l.WriteString(" /*!80023 INVISIBLE */")
 		}
 		if c.Comment != "" {
 			fmt.Fprintf(&l, " COMMENT %s", quoteSQLString(c.Comment))
@@ -245,6 +262,15 @@ func GenerateDDL(t *Table) string {
 		}
 		if fk.OnUpdate != "" {
 			line += " ON UPDATE " + fk.OnUpdate
+		}
+		lines = append(lines, line)
+	}
+	for _, cc := range t.CheckConstraints {
+		line := fmt.Sprintf("  CONSTRAINT %s CHECK (%s)", backquote(cc.Name), cc.Clause)
+		if !cc.Enforced {
+			// Versioned as SHOW CREATE TABLE writes it: a pre-8.0.16 server
+			// parses and ignores CHECK anyway.
+			line += " /*!80016 NOT ENFORCED */"
 		}
 		lines = append(lines, line)
 	}
@@ -358,7 +384,11 @@ func secondaryIndexColumnList(cols []SecondaryIndexColumn) string {
 	parts := make([]string, len(cols))
 	for i, c := range cols {
 		p := backquote(c.Col.Name)
-		if n := ddlPrefixLen(c.Col, c.PrefixLen); n > 0 {
+		if c.Col.Hidden == hiddenSQL {
+			// A functional key part (8.0.13+) indexes a hidden generated
+			// column; SHOW CREATE TABLE writes its expression in its place.
+			p = "(" + c.Col.GenExpr + ")"
+		} else if n := ddlPrefixLen(c.Col, c.PrefixLen); n > 0 {
 			p += fmt.Sprintf("(%d)", n)
 		}
 		if c.Desc {
@@ -367,6 +397,98 @@ func secondaryIndexColumnList(cols []SecondaryIndexColumn) string {
 		parts[i] = p
 	}
 	return strings.Join(parts, ",")
+}
+
+// currentTimestampRe matches a DEFAULT/ON UPDATE that is the
+// CURRENT_TIMESTAMP function itself (with its optional fractional-seconds
+// precision), rather than an expression default: the server rewrites
+// DEFAULT (CURRENT_TIMESTAMP) to "now()" when it stores it, so this bare
+// spelling is never an expression.
+var currentTimestampRe = regexp.MustCompile(`^CURRENT_TIMESTAMP(\([0-6]\))?$`)
+
+// columnDefaultClause renders c's " DEFAULT ..." and " ON UPDATE ..."
+// clauses (leading space included), or "" if it has neither - following
+// SHOW CREATE TABLE's own rules (print_default_clause in sql_show.cc): no
+// DEFAULT for an AUTO_INCREMENT or generated column, nor for a NOT NULL
+// column declared without one; DEFAULT NULL for any other nullable column
+// without a value, except BLOB/TEXT, which never show it (JSON and
+// GEOMETRY do); the CURRENT_TIMESTAMP function bare and an expression
+// default in parentheses; BIT as the server's own b'...' literal; and
+// everything else as a quoted string, numbers included ('0', not 0).
+// A binary-charset string's default comes from its raw record image
+// (DefaultRaw - see Column's comment), as 0x... hex if it isn't valid
+// UTF-8 (SHOW CREATE TABLE does the same); if that image is missing, the
+// DEFAULT is left out rather than guessed.
+func columnDefaultClause(c *Column) string {
+	if c.IsAutoIncrement || c.GenExpr != "" {
+		return ""
+	}
+	var def string
+	switch {
+	case c.DefaultOption != "":
+		if currentTimestampRe.MatchString(c.DefaultOption) {
+			def = c.DefaultOption
+		} else {
+			def = "(" + c.DefaultOption + ")"
+		}
+	case c.HasNoDefault:
+	case c.DefaultIsNull:
+		if c.IsNullable && !isBlobFamily(c.DDType) {
+			def = "NULL"
+		}
+	case c.DDType == ddBit || c.DefaultIsLiteral:
+		def = c.DefaultText // already b'...' / 0x...
+	case c.IsBinary() && (c.DDType == ddString || c.DDType == ddVarString || c.DDType == ddVarchar):
+		if v, ok := binaryDefaultValue(c); ok {
+			if utf8.Valid(v) {
+				def = quoteSQLString(string(v))
+			} else {
+				def = "0x" + strings.ToUpper(hex.EncodeToString(v))
+			}
+		}
+	default:
+		def = quoteSQLString(c.DefaultText)
+	}
+	var b strings.Builder
+	if def != "" {
+		b.WriteString(" DEFAULT " + def)
+	}
+	if c.UpdateOption != "" {
+		b.WriteString(" ON UPDATE " + c.UpdateOption)
+	}
+	return b.String()
+}
+
+// binaryDefaultValue extracts a BINARY/VARBINARY column's default from its
+// raw record image: BINARY(N) is all N bytes, 0x00 padding included (it's
+// part of the value); VARBINARY(N) is a 1-byte length prefix (2 bytes for
+// N >= 256) and then that many bytes.
+func binaryDefaultValue(c *Column) ([]byte, bool) {
+	raw := c.DefaultRaw
+	if raw == nil {
+		return nil, false
+	}
+	if c.DDType != ddVarchar {
+		if uint32(len(raw)) > c.ColLen {
+			raw = raw[:c.ColLen]
+		}
+		return raw, true
+	}
+	lenBytes := 1
+	if c.ColLen >= 256 {
+		lenBytes = 2
+	}
+	if len(raw) < lenBytes {
+		return nil, false
+	}
+	n := int(raw[0])
+	if lenBytes == 2 {
+		n |= int(raw[1]) << 8
+	}
+	if lenBytes+n > len(raw) {
+		return nil, false
+	}
+	return raw[lenBytes : lenBytes+n], true
 }
 
 // isBlobFamily reports whether ddType is a BLOB/TEXT-family column type -

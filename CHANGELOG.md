@@ -1,4 +1,53 @@
-## Unreleased
+## 0.8.2	26-Oct-2026
+
+## NEW FEATURES
+
+* The generated `CREATE TABLE` now has each column's `DEFAULT` and `ON
+  UPDATE` clauses, as `SHOW CREATE TABLE` writes them: literals,
+  `DEFAULT NULL`, `CURRENT_TIMESTAMP[(n)]`, `BIT` defaults and expression
+  defaults. They come from the SDI (MySQL 8.0+), or are decoded from a
+  `.frm` file's default-values record (MySQL 5.5-5.7, MariaDB, including
+  MariaDB's expression defaults). Checked by recreating test tables from
+  the generated DDL on MySQL 5.5, 5.7, 8.0 and MariaDB 10.11 and
+  comparing `SHOW CREATE TABLE` output.
+* `INVISIBLE` columns (MySQL 8.0.23+) are marked `/*!80023 INVISIBLE */` in
+  the generated `CREATE TABLE`, as `SHOW CREATE TABLE` writes them - which
+  includes the `my_row_id` column of a table with a generated invisible
+  primary key (`sql_generate_invisible_primary_key`). Their data was
+  already dumped (every `INSERT` and `LOAD DATA` names its columns).
+* `CHECK` constraints (MySQL 8.0.16+) are in the generated `CREATE TABLE`,
+  in the order `SHOW CREATE TABLE` lists them (by name), with `NOT
+  ENFORCED` ones marked `/*!80016 NOT ENFORCED */`. They were left out.
+* MyISAM tables with `BIT` columns can be extracted: MyISAM keeps a
+  `BIT(n)` column's `n%8` leftover bits in the record's null bitmap (and a
+  `BIT(1)`-`BIT(7)` has no field in the record at all), which is now
+  decoded. Such a table used to be refused with a "record length ...
+  doesn't match ... .MYI" error.
+* A spatial column's `SRID` attribute (MySQL 8.0.3+) is kept in the
+  generated `CREATE TABLE`, as `/*!80003 SRID n */`, where `SHOW CREATE
+  TABLE` writes it. Without it, the recreated column accepted geometries in
+  any spatial reference system, and a `SPATIAL` index on it was ignored by
+  the optimizer.
+
+## BUGS FIXED
+
+* A `FULLTEXT` index's auxiliary tables (`fts_..._index_1.ibd` ...
+  `fts_..._config.ibd`, `FTS_..._CONFIG.ibd` on 5.6/5.7) were taken for
+  ordinary tables, each failing with a warning ("SDI is missing the
+  DB_TRX_ID/DB_ROLL_PTR system columns", or a missing `.frm`). They're
+  InnoDB-internal and rebuilt by the server from the table's `FULLTEXT
+  KEY`, so `--source-dir` now skips them, saying how many, and `--file` on
+  one explains what it is.
+* `FULLTEXT` and `SPATIAL` keys of a MySQL 5.x InnoDB table (read from its
+  `.frm`) were left out of the generated `CREATE TABLE`, so the recreated
+  table had no such index. A 5.x `.frm` `GEOMETRY` subtype (`point`,
+  `polygon`, ...) also came out as plain `geometry`.
+* `FLOAT(M,D)`/`DOUBLE(M,D)` columns read from a MySQL 5.x `.frm` lost
+  their `(M,D)` in the generated `CREATE TABLE`, so the recreated column
+  no longer rounded values to `D` decimals.
+* A functional index (`KEY k ((a + b))`, MySQL 8.0.13+) was written as an
+  extra `!hidden!k!0!0` column with a plain index on it; it's now written
+  as the index's own expression, `KEY k (((a + b)))`.
 
 ## 0.8.1	13-Oct-2026
 

@@ -50,6 +50,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -63,7 +64,7 @@ const appName = "innodump"
 // The hardcoded fallback below is what a plain "go build"/"go install"
 // (no ldflags) prints instead - kept in sync with the latest tagged
 // release by hand.
-var version = "0.8.1"
+var version = "0.8.2"
 
 var (
 	filePath             = flag.String("file", "", "Path to the .ibd file to extract - or, for a MyRocks table, the datadir (or its .rocksdb directory, or the table's .sdi/.frm), with --table")
@@ -211,6 +212,9 @@ func run() error {
 // runSingleFile is the original, single-.ibd-file mode: --file (optionally
 // --table, when the file's SDI holds more than one table).
 func runSingleFile() error {
+	if isFTSAuxFile(*filePath) {
+		return errFTSAux(*filePath)
+	}
 	sp, err := OpenSpace(*filePath)
 	if err != nil {
 		return err
@@ -280,6 +284,9 @@ func runSingleFile() error {
 		target, err = pickTable(parsed, *filePath, *tableName)
 		if err != nil {
 			return err
+		}
+		if target.Hidden == ddTableHiddenSE {
+			return errFTSAux(*filePath)
 		}
 	}
 
@@ -827,6 +834,7 @@ func runSourceDir() error {
 	// sysdict.go for why this is only ever needed for a pre-8.0/MariaDB
 	// tablespace (innodb_file_per_table=0), never a modern SDI-based one.
 	var ibdFiles, frmFiles, mydFiles []string
+	nFTSAux := 0 // FULLTEXT index auxiliary tables, left out - see ftsAuxFileRe
 	walkErr := filepath.WalkDir(*sourceDir, func(path string, ent fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -839,6 +847,10 @@ func runSourceDir() error {
 		}
 		switch strings.ToLower(filepath.Ext(path)) {
 		case ".ibd":
+			if isFTSAuxFile(path) {
+				nFTSAux++
+				return nil
+			}
 			ibdFiles = append(ibdFiles, path)
 		case ".frm":
 			frmFiles = append(frmFiles, path)
@@ -920,6 +932,9 @@ func runSourceDir() error {
 		srcMsg += fmt.Sprintf(", a MyRocks data directory (%s)", filepath.Base(rocksDir))
 	}
 	fmt.Printf("%s %s (%s found)\n", dim("Source:     "), id(*sourceDir), srcMsg)
+	if nFTSAux > 0 {
+		fmt.Printf("%s %s\n", dim("Skipped:    "), val(fmt.Sprintf("%d FULLTEXT index auxiliary file(s) (fts_*.ibd) - InnoDB-internal; the server rebuilds them from each table's FULLTEXT KEY", nFTSAux)))
+	}
 
 	var nFilesOK, nFileErrs, nTables, nRowsTotal, nRowErrTotal, nCorruptTotal, nTruncatedTotal, nSkippedTotal, nNotFoundTotal int
 	for _, path := range ibdFiles {
@@ -1282,6 +1297,11 @@ func processTable(sp *Space, srcLabel, dir string, target *ddTableJSON, mysqlVer
 	if tsvDump != nil && !*includeSystemSchemas && isSystemSchema(target.SchemaRef) {
 		return false, 0, 0, 0, false, true
 	}
+	if target.Hidden == ddTableHiddenSE {
+		// A FULLTEXT index's auxiliary table under a file name ftsAuxFileRe
+		// didn't catch: InnoDB-internal, nothing to extract.
+		return false, 0, 0, 0, false, false
+	}
 	t, berr := BuildTable(target)
 	if berr != nil {
 		if !examineMode {
@@ -1429,6 +1449,30 @@ var systemSchemas = map[string]bool{
 
 func isSystemSchema(schema string) bool {
 	return systemSchemas[strings.ToLower(schema)]
+}
+
+// ftsAuxFileRe matches the file of one of the hidden tables InnoDB keeps
+// for a FULLTEXT index (fts0fts.cc's fts_get_table_name): six
+// fts_<table id>_<index id>_index_<N> tables per FULLTEXT index, plus five
+// per table with any (being_deleted, being_deleted_cache, config, deleted,
+// deleted_cache) - ids as 16 hex digits, lowercase on 8.0+ and uppercase
+// (FTS_..._CONFIG) on 5.6/5.7. They're the index's own inverted lists and
+// bookkeeping, not tables anyone created: the server rebuilds them from
+// scratch when the parent table's FULLTEXT KEY is created on load, so
+// there's nothing in them to extract.
+var ftsAuxFileRe = regexp.MustCompile(`(?i)^fts_[0-9a-f]{16}_([0-9a-f]{16}_index_[0-9]+|being_deleted|being_deleted_cache|config|deleted|deleted_cache)\.ibd$`)
+
+func isFTSAuxFile(path string) bool { return ftsAuxFileRe.MatchString(filepath.Base(path)) }
+
+// ddTableHiddenSE is dd::Abstract_table::HT_HIDDEN_SE, a table hidden by
+// the storage engine - on 8.0+, how a FULLTEXT index's auxiliary tables
+// (see ftsAuxFileRe) are recorded in their own SDI.
+const ddTableHiddenSE = 3
+
+// errFTSAux is what --file says about a FULLTEXT index auxiliary table.
+func errFTSAux(path string) error {
+	return fmt.Errorf("%s is one of InnoDB's FULLTEXT index auxiliary tables, not a table of its own - there's nothing to extract: "+
+		"the server rebuilds it when the parent table's FULLTEXT KEY is created. Extract the parent table's .ibd instead", path)
 }
 
 // loadTargets returns every table definition sp's tablespace holds - every

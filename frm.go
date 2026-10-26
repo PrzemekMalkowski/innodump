@@ -61,7 +61,16 @@ const (
 	legacyDBTypeInnoDB = 12
 	fieldGeneratedFlag = 0x80 // Field::GENERATED_FIELD, in unireg_type
 	fieldNextNumber    = 15   // Field::NEXT_NUMBER, in unireg_type & 0x7f
+	// Field::utype's CURRENT_TIMESTAMP markers (unireg_type & 0x7f): DEFAULT
+	// (DN), ON UPDATE (UN), or both (DNUN, and the 4.0-era OLD_FIELD, which
+	// behaves the same).
+	fieldTimestampOld  = 18
+	fieldTimestampDN   = 21
+	fieldTimestampUN   = 22
+	fieldTimestampDNUN = 23
 	fieldMaybeNull     = 0x8000
+	fieldNoDefault     = 0x4000 // FIELDFLAG_NO_DEFAULT: NOT NULL with no DEFAULT clause
+	fieldBitAsChar     = 0x1000 // FIELDFLAG_TREAT_BIT_AS_CHAR: a BIT stored in whole bytes, none in the null bitmap
 	fieldDecimalFlag   = 0x0001 // FIELDFLAG_DECIMAL/BINARY - "not unsigned" for numerics
 	fieldZerofillFlag  = 0x0004
 	fieldDecShift      = 8
@@ -244,11 +253,13 @@ type frmField struct {
 	fieldType     byte
 	length        uint32 // field_length
 	packFlag      uint32
-	unireg        byte // low 7 bits of unireg_type
+	unireg        byte   // low 7 bits of unireg_type
+	recpos        uint32 // 1-based offset of the field in the default-values record
 	generated     bool
 	csid          uint32
 	comment       string
 	intervalIndex uint32 // 1-based; 0 = none
+	geomType      byte   // a GEOMETRY column's subtype (Field::geometry_type), in csid's place
 }
 
 // parseFRMFields reads share->fields entries of frmFieldPackLength bytes
@@ -283,6 +294,7 @@ func parseFRMFields(data []byte, fieldsOff, numFields, nLength, intervalCount, i
 	for i := uint32(0); i < numFields; i++ {
 		fp := data[fieldsOff+i*frmFieldPackLength : fieldsOff+(i+1)*frmFieldPackLength]
 		length := frmU16(fp[3:5])
+		recpos := frmU24(fp[5:8])
 		packFlag := frmU16(fp[8:10])
 		unireg := fp[10]
 		intervalNr := uint32(fp[12])
@@ -290,8 +302,11 @@ func parseFRMFields(data []byte, fieldsOff, numFields, nLength, intervalCount, i
 		commentLen := frmU16(fp[15:17])
 
 		var csid uint32
+		var geomType byte
 		if fieldType != 255 { // MYSQL_TYPE_GEOMETRY shares this byte with geom_type instead
 			csid = uint32(fp[14]) + uint32(fp[11])<<8
+		} else {
+			geomType = fp[14]
 		}
 		var comment string
 		if commentLen > 0 {
@@ -307,10 +322,12 @@ func parseFRMFields(data []byte, fieldsOff, numFields, nLength, intervalCount, i
 			length:        length,
 			packFlag:      packFlag,
 			unireg:        unireg & 0x7f,
+			recpos:        recpos,
 			generated:     unireg&fieldGeneratedFlag != 0,
 			csid:          csid,
 			comment:       comment,
 			intervalIndex: intervalNr,
+			geomType:      geomType,
 		}
 	}
 	return fields, intervals, nil
@@ -341,7 +358,6 @@ func buildFRMColumn(f frmField, ordinal uint32, intervals [][]string) (ddColumnJ
 		OrdinalPosition: ordinal,
 		CollationID:     uint64(f.csid),
 		Comment:         f.comment,
-		HasNoDefault:    true, // .frm DEFAULT clauses are not reproduced - see the DDL output note in the README
 	}
 	if c.CollationID == 0 {
 		c.CollationID = 63 // my_charset_bin
@@ -433,10 +449,17 @@ func frmColumnTypeText(c *ddColumnJSON, f frmField) string {
 		return numSuffix(fmt.Sprintf("int(%d)", f.length))
 	case ddLonglong:
 		return numSuffix(fmt.Sprintf("bigint(%d)", f.length))
-	case ddFloat:
-		return numSuffix("float")
-	case ddDouble:
-		return numSuffix("double")
+	case ddFloat, ddDouble:
+		// FLOAT(M,D)/DOUBLE(M,D) keep their (M,D) - even (M,0); a plain
+		// FLOAT/DOUBLE, or FLOAT(p), has no fixed scale (NOT_FIXED_DEC).
+		base := "float"
+		if c.Type == ddDouble {
+			base = "double"
+		}
+		if c.NumericScale < frmNotFixedDec {
+			base += fmt.Sprintf("(%d,%d)", f.length, c.NumericScale)
+		}
+		return numSuffix(base)
 	case ddNewdecimal:
 		return numSuffix(fmt.Sprintf("decimal(%d,%d)", c.NumericPrecision, c.NumericScale))
 	case ddYear:
@@ -501,6 +524,9 @@ func frmColumnTypeText(c *ddColumnJSON, f frmField) string {
 	case ddSet:
 		return "set(" + frmQuoteElements(c.Elements) + ")"
 	case ddGeometry:
+		if int(f.geomType) < len(frmGeometryTypes) {
+			return frmGeometryTypes[f.geomType]
+		}
 		return "geometry"
 	case ddJSON:
 		return "json"
@@ -508,6 +534,11 @@ func frmColumnTypeText(c *ddColumnJSON, f frmField) string {
 		return ""
 	}
 }
+
+// frmGeometryTypes names Field::geometry_type's values (GEOM_GEOMETRY=0 ...
+// GEOM_GEOMETRYCOLLECTION=7) as SHOW CREATE TABLE writes them.
+var frmGeometryTypes = []string{"geometry", "point", "linestring", "polygon",
+	"multipoint", "multilinestring", "multipolygon", "geometrycollection"}
 
 func frmQuoteElements(els []ddElementJSON) string {
 	parts := make([]string, len(els))
@@ -612,13 +643,7 @@ func frmPartitionClause(data []byte) string {
 	if extraLen == 0 {
 		return ""
 	}
-	recordOffset := frmU16(head[6:8])
-	if frmU16(head[14:16]) == 0xffff {
-		recordOffset += frmU32(head[47:51])
-	} else {
-		recordOffset += frmU16(head[14:16])
-	}
-	start := uint64(recordOffset) + uint64(frmU16(head[16:18]))
+	start := frmRecordOffset(head) + uint64(frmU16(head[16:18]))
 	end := start + uint64(extraLen)
 	if end > uint64(len(data)) {
 		return ""
@@ -655,13 +680,7 @@ func frmEngineName(data []byte) string {
 	if extraLen == 0 {
 		return ""
 	}
-	recordOffset := frmU16(head[6:8])
-	if frmU16(head[14:16]) == 0xffff {
-		recordOffset += frmU32(head[47:51])
-	} else {
-		recordOffset += frmU16(head[14:16])
-	}
-	start := uint64(recordOffset) + uint64(frmU16(head[16:18]))
+	start := frmRecordOffset(head) + uint64(frmU16(head[16:18]))
 	end := start + uint64(extraLen)
 	if end > uint64(len(data)) {
 		return ""
@@ -820,6 +839,7 @@ func readFRMDefinition(path string) (*frmDefinition, error) {
 	intervalCount := frmU16(forminfo[270:272])
 	intLength := frmU16(forminfo[274:276])
 	comLength := frmU16(forminfo[284:286])
+	exprLength := frmU16(forminfo[286:288])
 
 	var tableComment string
 	if forminfo[46] != 255 {
@@ -848,11 +868,40 @@ func readFRMDefinition(path string) (*frmDefinition, error) {
 	schemaRef := decodeMySQLFilename(filepath.Base(filepath.Dir(path)))
 	rawTable := &ddTableJSON{Name: tableName, SchemaRef: schemaRef, Comment: tableComment, CollationID: uint64(tableCharsetID(head))}
 	rawTable.Columns = make([]ddColumnJSON, 0, numFields+3)
+	defaults := frmDefaultRecord(data)
+	var defaultExprs map[uint32]string
+	if frmVer >= frmVerExpressions && exprLength > 0 {
+		// Right after the names, ENUM/SET values and comments.
+		exprOff := fieldsOff + numFields*frmFieldPackLength + nLength + intLength + comLength
+		if int(exprOff+exprLength) <= len(data) {
+			defaultExprs = frmDefaultExpressions(data[exprOff : exprOff+exprLength])
+		}
+	}
+	// The default-values record's null bitmap: one bit per nullable
+	// column, in column order, after a reserved first bit unless the
+	// table packs its records - and, between them, the 1-7 leftover high
+	// bits of any BIT column not stored as whole bytes (open_binary_frm's
+	// null_pos/null_bit_pos walk in table.cc, and make_field's bit_ptr).
+	nullBit := 1
+	if frmU16(head[30:32])&haOptionPackRecord != 0 {
+		nullBit = 0
+	}
 	for i, f := range fields {
 		c, err := buildFRMColumn(f, uint32(i), intervals)
 		if err != nil {
 			return nil, err
 		}
+		nb := -1
+		if f.packFlag&fieldMaybeNull != 0 {
+			nb = nullBit
+			nullBit++
+		}
+		bitHiPos, bitHiLen := nullBit, 0
+		if c.Type == ddBit && f.packFlag&fieldBitAsChar == 0 {
+			bitHiLen = int(f.length & 7)
+			nullBit += bitHiLen
+		}
+		frmApplyDefault(&c, f, defaults, defaultExprs[uint32(i)], nb, bitHiPos, bitHiLen)
 		rawTable.Columns = append(rawTable.Columns, c)
 	}
 	return &frmDefinition{table: rawTable, keys: keys, legacyDBType: head[3], createOptions: frmU16(head[30:32]),
@@ -988,13 +1037,23 @@ func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) 
 	rawTable.Indexes = append(rawTable.Indexes, clust)
 
 	for i, k := range keys {
-		if i == pkIdx || k.fulltext || k.spatial {
-			continue // fulltext/spatial rendering isn't attempted for the InnoDB .frm path (v1 limitation)
+		if i == pkIdx {
+			continue
 		}
+		// Secondary indexes only ever reach the DDL (the clustered index
+		// holds every row), so a FULLTEXT or SPATIAL one needs nothing but
+		// its type - and keeping it matters: the FULLTEXT KEY in the DDL is
+		// what has the server rebuild the index's auxiliary tables, which
+		// extraction skips (see ftsAuxFileRe in main.go).
 		idx := ddIndexJSON{Name: k.name, IsVisible: true}
-		if k.unique {
+		switch {
+		case k.fulltext:
+			idx.Type = ddIndexFulltext
+		case k.spatial:
+			idx.Type = ddIndexSpatial
+		case k.unique:
 			idx.Type = ddIndexUnique
-		} else {
+		default:
 			idx.Type = ddIndexMultiple
 		}
 		for _, p := range k.parts {
@@ -1004,8 +1063,9 @@ func parseFRM(path string, sp *Space, loc *TableLocation) (*ddTableJSON, error) 
 			col := colsByOpx[p.fieldnr-1]
 			el := ddIndexElementJSON{ColumnOpx: p.fieldnr - 1}
 			// A BLOB/TEXT key part is always a prefix, even though its
-			// length exceeds the column's own (tiny) in-record pack length.
-			if fullLen, err := packLength(&col); err == nil && (p.length < fullLen || isBlobFamily(col.Type)) {
+			// length exceeds the column's own (tiny) in-record pack length -
+			// except in a FULLTEXT/SPATIAL index, which never takes one.
+			if fullLen, err := packLength(&col); err == nil && !k.fulltext && !k.spatial && (p.length < fullLen || isBlobFamily(col.Type)) {
 				el.Length = p.length
 			}
 			idx.Elements = append(idx.Elements, el)

@@ -484,6 +484,8 @@ func buildPlainTable(raw *ddTableJSON, engine string) (*Table, error) {
 	}
 	// MySQL refuses to create a FOREIGN KEY on a non-InnoDB table, so a
 	// MyISAM table's own dd_object never carries any - nothing to build.
+	// CHECK constraints, unlike FOREIGN KEYs, work on any engine.
+	t.CheckConstraints = buildCheckConstraints(raw)
 	return t, nil
 }
 
@@ -528,13 +530,61 @@ type myisamLayout struct {
 	// its own free-list link (see minFixedSlotLength), or exactly what the
 	// .MYI header says it is when there is one (see applyMYIHeader).
 	SlotLength uint32
-	PackBits   int  // bytes of packed-record flag bitmap (DYNAMIC only - see unpackMyISAMRecord)
-	Fixed      bool // ROW_FORMAT=FIXED (static): every field is mfNormal, one record every SlotLength bytes
+	PackBits   int // bytes of packed-record flag bitmap (DYNAMIC only - see unpackMyISAMRecord)
+	// Bits locates every BIT column's value - see myisamBit. A BIT(1)-
+	// BIT(7) column has no entry in Fields at all.
+	Bits  map[*Column]myisamBit
+	Fixed bool // ROW_FORMAT=FIXED (static): every field is mfNormal, one record every SlotLength bytes
 	// MYIRecords is the live row count the .MYI header recorded (HaveMYI
 	// false if there was no usable .MYI) - reported alongside --verbose's
 	// own detail, as a sanity check against the rows a scan finds.
 	MYIRecords uint64
 	HaveMYI    bool
+}
+
+// myisamBit is where a BIT(n) column keeps its value. MyISAM stores BIT
+// natively (HA_CAN_BIT_FIELD): only the n/8 whole bytes go in the record
+// itself (a field of its own, Field >= 0; none at all - Field -1 - for
+// BIT(1)-BIT(7), which gets no MI_COLUMNDEF either), and the n%8 leftover
+// high bits (HiLen) sit in the null bitmap from bit HiPos on, right after
+// the column's own null bit - open_binary_frm's null_bit_pos walk and
+// Field_bit's bit_ptr/bit_ofs (table.cc/field.cc). NullByte/NullMask are
+// the column's own null bit, for a BIT column without a Field.
+type myisamBit struct {
+	Field    int
+	Bytes    uint32
+	HiPos    int
+	HiLen    int
+	NullByte int
+	NullMask byte
+}
+
+// value assembles the column's full value from rec, as the big-endian
+// ceil(n/8) bytes an InnoDB record stores it in (decodeField's own input).
+func (b myisamBit) value(rec *myisamRecord, lay *myisamLayout) []byte {
+	var v uint64
+	for i := 0; i < b.HiLen; i++ {
+		pos := b.HiPos + i
+		if rec.Buf[pos/8]&(1<<uint(pos%8)) != 0 {
+			v |= 1 << uint(i)
+		}
+	}
+	if b.Field >= 0 {
+		f := lay.Fields[b.Field]
+		for _, x := range rec.Buf[f.Offset : f.Offset+f.Length] {
+			v = v<<8 | uint64(x)
+		}
+	}
+	n := b.Bytes
+	if b.HiLen > 0 {
+		n++
+	}
+	out := make([]byte, n)
+	for i := int(n) - 1; i >= 0; i-- {
+		out[i] = byte(v)
+		v >>= 8
+	}
+	return out
 }
 
 // classifyMyISAMField decides one non-virtual column's myisamFieldKind,
@@ -611,7 +661,7 @@ func buildMyISAMLayout(t *Table) (*myisamLayout, error) {
 	lay := &myisamLayout{Fixed: t.RowFormat == rowFormatFixed}
 
 	var physCols []*Column
-	nNullable := 0
+	nNullable, bitHi := 0, 0
 	for _, c := range t.Columns {
 		if c.IsVirtual {
 			continue // a virtual generated column is computed on read, never stored
@@ -619,6 +669,9 @@ func buildMyISAMLayout(t *Table) (*myisamLayout, error) {
 		physCols = append(physCols, c)
 		if c.IsNullable {
 			nNullable++
+		}
+		if c.DDType == ddBit {
+			bitHi += int(c.raw.CharLength & 7)
 		}
 	}
 	// A FIXED-format table (no HA_OPTION_PACK_RECORD) reserves the null
@@ -635,7 +688,8 @@ func buildMyISAMLayout(t *Table) (*myisamLayout, error) {
 	if lay.Fixed {
 		reservedBits = 1
 	}
-	lay.NullBytes = (nNullable + reservedBits + 7) / 8
+	lay.NullBytes = (nNullable + bitHi + reservedBits + 7) / 8
+	lay.Bits = map[*Column]myisamBit{}
 
 	var offset uint32
 	if lay.NullBytes > 0 {
@@ -656,6 +710,19 @@ func buildMyISAMLayout(t *Table) (*myisamLayout, error) {
 			f.NullMask = 1 << uint(nullIdx%8)
 			nullIdx++
 		}
+		if c.DDType == ddBit {
+			b := myisamBit{Field: -1, Bytes: c.raw.CharLength / 8, HiPos: nullIdx, HiLen: int(c.raw.CharLength & 7),
+				NullByte: f.NullByte, NullMask: f.NullMask}
+			nullIdx += b.HiLen
+			f.Length = b.Bytes
+			if b.Bytes > 0 {
+				b.Field = len(lay.Fields)
+			}
+			lay.Bits[c] = b
+			if b.Bytes == 0 {
+				continue // all of it lives in the null bitmap
+			}
+		}
 		if lay.Fixed {
 			f.Kind = mfNormal
 		} else {
@@ -669,7 +736,7 @@ func buildMyISAMLayout(t *Table) (*myisamLayout, error) {
 			}
 		}
 		lay.Fields = append(lay.Fields, f)
-		offset += pl
+		offset += f.Length
 	}
 	lay.RecLength = offset
 	lay.PackBits = (packedFields + 7) / 8
@@ -1391,6 +1458,19 @@ func decodeMyISAMRow(rec *myisamRecord, lay *myisamLayout, fieldIdx map[*Column]
 	}()
 	values := make([]string, len(outCols))
 	for i, col := range outCols {
+		if b, ok := lay.Bits[col]; ok {
+			if b.NullByte >= 0 && rec.Buf[b.NullByte]&b.NullMask != 0 {
+				values[i] = nullLiteral(format)
+				continue
+			}
+			v := b.value(rec, lay)
+			lit, ferr := decodeField(nil, col, v, fieldRange{End: uint32(len(v))}, format)
+			if ferr != nil {
+				return nil, fmt.Errorf("column %q: %w", col.Name, ferr)
+			}
+			values[i] = lit
+			continue
+		}
 		fi, ok := fieldIdx[col]
 		if !ok {
 			return nil, fmt.Errorf("column %q has no physical field in this table's own layout (internal error)", col.Name)
@@ -1505,7 +1585,9 @@ func decodeMyISAMField(col *Column, raw []byte, format outputFormat) (lit string
 		}
 		return quoteText(strings.Join(parts, ","), format), nil
 	case ddBit:
-		return "", fmt.Errorf("column %q: BIT columns on MyISAM are not supported yet (v1 limitation)", col.Name)
+		// Never reached for a row: decodeMyISAMRow assembles a BIT value
+		// from the record and the null bitmap itself (myisamBit).
+		return "", fmt.Errorf("column %q: BIT value decoded without its null-bitmap bits (internal error)", col.Name)
 
 	case ddJSON:
 		return quoteText(jsonBinaryToText(raw), format), nil

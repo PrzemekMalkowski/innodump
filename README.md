@@ -169,7 +169,7 @@ innodump --file /path/to/table.ibd [options]
 | `--compression-level N` | zstd level 1-22 (default `1`, `util.dumpSchemas()`'s own default); only with `--compression=zstd`. |
 | `--table NAME` | Which table to extract when the file holds more than one - required for a shared tablespace. Not usable with `--source-dir`. |
 | `--limit N` | Stop after N rows (0 = all). |
-| `--ddl-only` | Only write the schema file(s); don't read any row data. |
+| `--ddl-only` | Schema only: write each table's `CREATE TABLE` and skip its rows entirely (no row data is read). Works with both formats - `sql` writes only the `-schema.sql` files, `tsv` a dump with DDL and no data files. |
 | `--myisam-to-innodb` | Write MyISAM tables' DDL as `ENGINE=InnoDB`, adding a `KEY` where InnoDB would reject the `AUTO_INCREMENT` column. Row data is unchanged. |
 | `--rocksdb-to-innodb` | Write MyRocks tables' DDL as `ENGINE=InnoDB`, without the index `COMMENT`s MyRocks uses for column family placement. Row data is unchanged. |
 | `--rocksdb-dir DIR` | MyRocks: the RocksDB directory, when it isn't the datadir's own `.rocksdb/` (`rocksdb_datadir` pointed elsewhere). |
@@ -343,11 +343,16 @@ reason rather than guessed at:
 - MariaDB tablespaces using the classic (non-`full_crc32`) checksums -
   effectively MariaDB older than 10.4, or with `full_crc32` turned off -
   and MariaDB's `page_compression`.
-- MyISAM `ROW_FORMAT=COMPRESSED` (`myisampack`) tables and MyISAM `BIT`
-  columns.
+- MyISAM `ROW_FORMAT=COMPRESSED` (`myisampack`) tables.
 
 `FULLTEXT` and `SPATIAL` indexes appear in the DDL but are never read; only
-the clustered index is, and it holds all the data.
+the clustered index is, and it holds all the data. A `FULLTEXT` index's own
+auxiliary tables - `fts_<table id>_<index id>_index_1.ibd` to `_index_6`,
+and `fts_<table id>_being_deleted`, `_being_deleted_cache`, `_config`,
+`_deleted` and `_deleted_cache` (`FTS_..._CONFIG.ibd` and so on on 5.6/5.7)
+- are InnoDB-internal: `--source-dir` skips them (reporting how many), and
+`--file` on one says so. Nothing is lost: the server rebuilds them when the
+`FULLTEXT KEY` in the generated DDL is created.
 
 The explicit checks cover the cases above. A decoding bug on an unusual
 table can still fail in a misleading way - past bugs have shown up as
@@ -467,10 +472,12 @@ current servers.
 
 Both `FIXED` and `DYNAMIC` rows are supported, including `DYNAMIC` records
 that later `UPDATE`s split across several blocks, and `CHECKSUM=1` tables.
-`ROW_FORMAT=COMPRESSED` (`myisampack`) is detected and refused, and `BIT`
-columns aren't decoded yet; every other type supported for InnoDB is
-supported here. `CHAR` values are written without trailing padding, as
-`SELECT` returns them.
+`ROW_FORMAT=COMPRESSED` (`myisampack`) is detected and refused; every type
+supported for InnoDB is supported here. That includes `BIT`, which MyISAM
+stores differently: a `BIT(n)` keeps only its `n/8` whole bytes in the
+record and its `n%8` leftover bits in the record's null bitmap (a `BIT(1)`
+to `BIT(7)` has no field in the record at all). `CHAR` values are written
+without trailing padding, as `SELECT` returns them.
 
 `--skip-corrupted` works as for InnoDB. By default a `.MYD` whose block
 structure doesn't parse is a fatal error naming where and why. With
@@ -479,22 +486,6 @@ corrupted record ...` comment in the data file) and the scan resumes at the
 next position that looks like a valid record header. A `.MYD` has no page
 checksums to confirm that, so a damaged file can yield a few garbled rows
 around the damage as well as losing the ones inside it.
-
-Cross-checked against a MyISAM table served by MySQL 8.0+/MariaDB
-(`DYNAMIC`, every scalar type decoded for MyISAM, a nullable `TEXT`,
-`PRIMARY KEY`/`UNIQUE`/plain/`FULLTEXT` indexes, 10,000 rows):
-field-by-field against `myisamchk -dvv`'s per-column layout, and
-row-for-row against the server's `SELECT *` - all 10,000 rows matched.
-
-The `.frm` path was checked against a real MySQL 5.6.47 server reading the
-same datadir: every MyISAM table in it (`mysql` and an application schema),
-and a purpose-built schema covering every scalar type decoded for MyISAM
-(`NULL`s, zero dates, negative fractional `TIME`s, `SET`s wider than 3
-bytes, utf8 and latin1 `CHAR`/`VARCHAR`, `BINARY`/`VARBINARY`), `FIXED` and
-`DYNAMIC` tables, deleted rows, fragmented records, `CHECKSUM=1`,
-prefix/`FULLTEXT` keys and a filename-encoded table name. Each was dumped,
-reloaded into the same server, and matched the original's `CHECKSUM
-TABLE`.
 
 ## Migrating MyISAM tables to InnoDB (`--myisam-to-innodb`)
 
@@ -670,6 +661,11 @@ MANIFEST and `CURRENT`, damaging WALs, and damaging 2% of every SST
 file's bytes at random: each case recovered what the damage left intact
 and reported the rest.
 
+A RocksDB directory whose dictionary reads fine but lists no tables, with
+no data outside `__system__` (an instance where MyRocks was enabled but
+never used), is reported as holding no MyRocks tables rather than as
+damaged.
+
 ### When the MyRocks dictionary is damaged
 
 If the `__system__` column family's own blocks are lost, a table can drop
@@ -706,45 +702,8 @@ level MyRocks refuses (`--format=sql` dumps load into MyRocks fine).
   partitioned can't be matched to its rows (see above).
 - `--dump-page` and `--debug` apply to InnoDB only.
 
-### Validation
-
-Checked end to end, as for InnoDB: each table dumped (from a copy of a
-live datadir, a cleanly stopped one, and a crashed one), reloaded, and
-compared row for row with the original (`mysqldump --hex-blob
---order-by-primary` of both, identical):
-
-- **Percona Server 8.4.11**: every scalar type (including `JSON`, `BIT`,
-  `ENUM`/`SET`, all temporal types with fractional seconds, `BLOB`s up to
-  5MB, stored/virtual generated and invisible columns); a primary key over
-  every decodable type and collation family (`utf8mb4_0900_ai_ci`,
-  `utf8mb4_general_ci`, `utf8mb3_general_ci`, `utf8mb4_bin`, `utf8mb3_bin`,
-  `latin1_bin`, `latin1_swedish_ci`, binary, prefix keys, composite keys);
-  hidden and promoted-`UNIQUE` primary keys; RANGE/HASH/subpartitioned
-  tables; reverse and custom column families; TTL and `INSTANT ADD
-  COLUMN` tables; 250,000 bulk-loaded rows; tables after full manual
-  compaction; and six column families covering ZSTD (with a trained
-  dictionary), Zlib, LZ4, LZ4HC and no compression, all four checksum
-  types plus none, `format_version` 2-6 and all four index types.
-  `--format=tsv --rocksdb-to-innodb` dumps were loaded with
-  `util.loadDump()` and matched as well.
-- **Percona Server 9.7.2**: MyRocks tables, a partitioned one among them.
-- **Percona Server 8.0.35**: the MyRocks tables of a real 8.0 datadir.
-- **Percona Server 5.7.44** and **MariaDB 10.6.28** (`.frm`, older
-  `kv_format_version`): the same approach over every type, `latin1`,
-  `utf8`, `utf8mb4_bin` and binary keys, hidden keys, partitioned and
-  reverse-ordered tables.
-
-So MyRocks extraction is tested on Percona Server 5.7, 8.0, 8.4 and 9.7,
-and on MariaDB 10.6.
-
-A RocksDB directory whose dictionary reads fine but lists no tables, with
-no data outside `__system__` (an instance where MyRocks was enabled but
-never used), is reported as holding no MyRocks tables rather than as
-damaged.
-
-Speed: about 600,000 rows/s for a 3-million-row table on 22 cores (the
-RocksDB merge itself is sequential; decoding and rendering rows runs in
-parallel, as for InnoDB).
+Tested on Percona Server 5.7, 8.0, 8.4 and 9.7, and MariaDB 10.6 - see
+"Validation".
 
 ## Partitioned tables
 
@@ -880,17 +839,46 @@ Dropped columns are left out of the `CREATE TABLE` and the `INSERT`s, as
 
 ## Output notes
 
-- **DDL is best-effort.** Reproduced: column types (with
-  `unsigned`/`zerofill`), nullability, `AUTO_INCREMENT`, comments,
-  generated-column expressions (SDI only), the `PRIMARY KEY`, secondary
-  indexes (`KEY`/`UNIQUE`/`FULLTEXT`/`SPATIAL`, with prefix lengths, `DESC`
-  and `INVISIBLE`), `FOREIGN KEY`s (with `ON DELETE`/`ON UPDATE` unless
-  they're the implicit `NO ACTION`), and the table's and columns' charsets
-  and collations, following `SHOW CREATE TABLE`'s rules for when a column
-  needs an explicit `CHARACTER SET`/`COLLATE` (see `sqlout.go`'s
-  `GenerateDDL` and `collations.go`). **`DEFAULT` clauses and other
-  table-level options are not reproduced** - add them by hand, or use the
-  original `SHOW CREATE TABLE` output if you have it.
+- **DDL follows `SHOW CREATE TABLE`** (see `sqlout.go`'s `GenerateDDL`),
+  closely enough that recreating a table from it gives back the same `SHOW
+  CREATE TABLE` output in the cases tested (MySQL 5.5, 5.7, 8.0, 8.4 and
+  MariaDB 10.11). Reproduced:
+  - column types, with `unsigned`/`zerofill` and `FLOAT(M,D)`/`DOUBLE(M,D)`;
+    nullability; `DEFAULT` and `ON UPDATE` clauses (see below);
+    `AUTO_INCREMENT`; comments; a column's `CHARACTER SET`/`COLLATE` where
+    `SHOW CREATE TABLE` would show one (`collations.go`);
+  - generated columns (SDI only), `INVISIBLE` columns as `/*!80023
+    INVISIBLE */` (including a generated invisible primary key's
+    `my_row_id`), and a spatial column's `SRID` as `/*!80003 SRID n */`
+    (SDI only);
+  - the `PRIMARY KEY` and secondary indexes (`KEY`/`UNIQUE`/`FULLTEXT`/
+    `SPATIAL`, with prefix lengths, `DESC`, `INVISIBLE` and functional key
+    parts such as `KEY k (((a + b)))`);
+  - `FOREIGN KEY`s (with `ON DELETE`/`ON UPDATE` unless they're the
+    implicit `NO ACTION`) and `CHECK` constraints (MySQL 8.0.16+, in name
+    order, `NOT ENFORCED` as `/*!80016 NOT ENFORCED */`);
+  - the table's engine, `ROW_FORMAT` (where `SHOW CREATE TABLE` states
+    one), default charset/collation, `COMPRESSION`, `COMMENT`, partitioning,
+    and `AUTO_INCREMENT=` (see below).
+
+  Not reproduced - add these by hand, or use the original `SHOW CREATE
+  TABLE` output if you have it: other table options (`KEY_BLOCK_SIZE`,
+  `STATS_*`, `ENCRYPTION`, an explicit MyISAM `ROW_FORMAT=FIXED`, ...),
+  and, from a MariaDB `.frm`, `CHECK` constraints, `INVISIBLE` columns,
+  `REF_SYSTEM_ID` and MariaDB's own data types (`UUID` comes out as its
+  storage type, `char(36)`). Only tables are dumped - no views, triggers or
+  stored routines.
+- **`DEFAULT` clauses** follow `SHOW CREATE TABLE`: literals quoted (`int
+  DEFAULT '0'`), `BIT` as `b'...'`, `DEFAULT NULL` for a nullable column
+  without one (except `BLOB`/`TEXT`), `CURRENT_TIMESTAMP[(n)]` bare,
+  expression defaults (MySQL 8.0.13+, MariaDB 10.2+) in parentheses, and
+  `ON UPDATE CURRENT_TIMESTAMP[(n)]`. From the SDI they come from each
+  column's recorded default; a `BINARY`/`VARBINARY` default is decoded from
+  its raw value (the SDI's text form of it is unreliable) and written as
+  `0x...` hex if it isn't valid UTF-8. From a `.frm` they're decoded from
+  its default-values record (and, on MariaDB, its expressions section); a
+  string default in a charset other than UTF-8, latin1 or plain ASCII is
+  written as `0x...` hex, which MySQL reads in the column's own charset.
 - **Index prefix lengths** are written in characters, as `SHOW CREATE
   TABLE` does (the dictionary stores bytes); a key part covering its whole
   column gets no prefix, and a `BLOB`/`TEXT` key part always keeps its own.
@@ -1049,6 +1037,10 @@ Decoding rows and rendering them as SQL or TSV runs in parallel across
 original order through a buffered writer (see `btree.go`'s `WalkRows` and
 `decodeBatch`).
 
+MyRocks: about 600,000 rows/s for a 3-million-row table on 22 cores. The
+RocksDB merge itself is sequential; decoding and rendering rows runs in
+parallel, as for InnoDB.
+
 ## Examining a datadir (`--examine`)
 
 `--examine` answers "what's in here, and is it all readable?" without
@@ -1138,6 +1130,10 @@ turns it off.
 
 ## Validation
 
+Unless noted otherwise, everything here was checked the same way: tables
+dumped, the dump reloaded into a real server, and the result compared with
+the original.
+
 **MySQL 8.0/8.4.** Checked end to end against MySQL 8.0.19, 8.0.46 and
 8.4.11: each test table was dumped, the `*-schema.sql` and `*-data.sql`
 reloaded into a fresh database, and diffed against the original (`SELECT *
@@ -1173,6 +1169,58 @@ for row (the partitioned table via `CHECKSUM TABLE`). The only two
 tables 8.0 refused were original `COMPACT` InnoDB tables with rows over its
 8126-byte in-page limit, which 5.6 had allowed without strict mode;
 `sessionInitSql: ["SET SESSION innodb_strict_mode=0"]` loads them.
+
+**MyISAM.** Cross-checked against a MyISAM table served by MySQL 8.0+/MariaDB
+(`DYNAMIC`, every scalar type decoded for MyISAM, a nullable `TEXT`,
+`PRIMARY KEY`/`UNIQUE`/plain/`FULLTEXT` indexes, 10,000 rows):
+field-by-field against `myisamchk -dvv`'s per-column layout, and
+row-for-row against the server's `SELECT *` - all 10,000 rows matched.
+
+The `.frm` path was checked against a real MySQL 5.6.47 server reading the
+same datadir: every MyISAM table in it (`mysql` and an application schema),
+and a purpose-built schema covering every scalar type decoded for MyISAM
+(`NULL`s, zero dates, negative fractional `TIME`s, `SET`s wider than 3
+bytes, utf8 and latin1 `CHAR`/`VARCHAR`, `BINARY`/`VARBINARY`), `FIXED` and
+`DYNAMIC` tables, deleted rows, fragmented records, `CHECKSUM=1`,
+prefix/`FULLTEXT` keys and a filename-encoded table name. Each was dumped,
+reloaded into the same server, and matched the original's `CHECKSUM
+TABLE`.
+
+**MyRocks.** Each table was dumped (from a copy of a live datadir, a
+cleanly stopped one, and a crashed one), reloaded, and compared row for
+row with the original (`mysqldump --hex-blob --order-by-primary` of both,
+identical):
+
+- **Percona Server 8.4.11**: every scalar type (including `JSON`, `BIT`,
+  `ENUM`/`SET`, all temporal types with fractional seconds, `BLOB`s up to
+  5MB, stored/virtual generated and invisible columns); a primary key over
+  every decodable type and collation family (`utf8mb4_0900_ai_ci`,
+  `utf8mb4_general_ci`, `utf8mb3_general_ci`, `utf8mb4_bin`, `utf8mb3_bin`,
+  `latin1_bin`, `latin1_swedish_ci`, binary, prefix keys, composite keys);
+  hidden and promoted-`UNIQUE` primary keys; RANGE/HASH/subpartitioned
+  tables; reverse and custom column families; TTL and `INSTANT ADD
+  COLUMN` tables; 250,000 bulk-loaded rows; tables after full manual
+  compaction; and six column families covering ZSTD (with a trained
+  dictionary), Zlib, LZ4, LZ4HC and no compression, all four checksum
+  types plus none, `format_version` 2-6 and all four index types.
+  `--format=tsv --rocksdb-to-innodb` dumps were loaded with
+  `util.loadDump()` and matched as well.
+- **Percona Server 9.7.2**: MyRocks tables, a partitioned one among them.
+- **Percona Server 8.0.35**: the MyRocks tables of a real 8.0 datadir.
+- **Percona Server 5.7.44** and **MariaDB 10.6.28** (`.frm`, older
+  `kv_format_version`): the same approach over every type, `latin1`,
+  `utf8`, `utf8mb4_bin` and binary keys, hidden keys, partitioned and
+  reverse-ordered tables.
+
+**DDL.** The generated `CREATE TABLE` was checked by recreating each test
+table from it and comparing `SHOW CREATE TABLE` with the original's, and
+the reloaded rows with the original rows, on MySQL 5.5.62, 5.7.44, 8.0.40
+and 8.4.6 and MariaDB 10.11: `DEFAULT`/`ON UPDATE` clauses of every kind,
+`INVISIBLE` columns and generated invisible primary keys, `SRID`s, `CHECK`
+constraints, functional, `FULLTEXT` and `SPATIAL` indexes (`FULLTEXT`
+searches returning the same rows after reloading), `FLOAT(M,D)`, every
+geometry subtype, and MyISAM `BIT` columns. `--format=tsv` dumps of the
+8.0 and 8.4 tables were loaded with `util.loadDump()` and matched as well.
 
 **Corruption.** Flipping a byte in one leaf page of a 2,000-row, 72-leaf
 table: the default run stopped with the exact page, index and reason, and

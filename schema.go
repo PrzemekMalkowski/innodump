@@ -125,22 +125,32 @@ type ddElementJSON struct {
 }
 
 type ddColumnJSON struct {
-	Name                     string          `json:"name"`
-	Type                     uint32          `json:"type"`
-	IsNullable               bool            `json:"is_nullable"`
-	IsZerofill               bool            `json:"is_zerofill"`
-	IsUnsigned               bool            `json:"is_unsigned"`
-	IsAutoIncrement          bool            `json:"is_auto_increment"`
-	IsVirtual                bool            `json:"is_virtual"`
-	Hidden                   uint32          `json:"hidden"`
-	OrdinalPosition          uint32          `json:"ordinal_position"`
-	CharLength               uint32          `json:"char_length"`
-	NumericPrecision         uint32          `json:"numeric_precision"`
-	NumericScale             uint32          `json:"numeric_scale"`
-	DatetimePrecision        uint32          `json:"datetime_precision"`
-	HasNoDefault             bool            `json:"has_no_default"`
-	DefaultValueUtf8Null     bool            `json:"default_value_utf8_null"`
-	DefaultValueUtf8         string          `json:"default_value_utf8"`
+	Name                 string `json:"name"`
+	Type                 uint32 `json:"type"`
+	IsNullable           bool   `json:"is_nullable"`
+	IsZerofill           bool   `json:"is_zerofill"`
+	IsUnsigned           bool   `json:"is_unsigned"`
+	IsAutoIncrement      bool   `json:"is_auto_increment"`
+	IsVirtual            bool   `json:"is_virtual"`
+	Hidden               uint32 `json:"hidden"`
+	OrdinalPosition      uint32 `json:"ordinal_position"`
+	CharLength           uint32 `json:"char_length"`
+	NumericPrecision     uint32 `json:"numeric_precision"`
+	NumericScale         uint32 `json:"numeric_scale"`
+	DatetimePrecision    uint32 `json:"datetime_precision"`
+	HasNoDefault         bool   `json:"has_no_default"`
+	DefaultValueUtf8Null bool   `json:"default_value_utf8_null"`
+	DefaultValueUtf8     string `json:"default_value_utf8"`
+	DefaultValue         string `json:"default_value"`  // base64 of the default in the server's own record format
+	DefaultOption        string `json:"default_option"` // CURRENT_TIMESTAMP[(n)], or an expression default's text (8.0.13+)
+	UpdateOption         string `json:"update_option"`  // ON UPDATE CURRENT_TIMESTAMP[(n)]
+	// DefaultIsLiteral is never in an SDI: frm_default.go sets it when
+	// DefaultValueUtf8 is already a SQL literal (0x... hex) to print as-is.
+	DefaultIsLiteral bool `json:"-"`
+	// A spatial column's SRID (8.0.3+). A pointer, since an SDI from before
+	// the attribute existed has no srs_id at all, and SRID 0 is a real one.
+	SrsID                    *uint32         `json:"srs_id"`
+	SrsIDNull                bool            `json:"srs_id_null"`
 	Comment                  string          `json:"comment"`
 	GenerationExpressionUtf8 string          `json:"generation_expression_utf8"`
 	SePrivateData            string          `json:"se_private_data"`
@@ -191,6 +201,7 @@ type ddTableJSON struct {
 	CollationID                uint64             `json:"collation_id"`
 	Indexes                    []ddIndexJSON      `json:"indexes"`
 	ForeignKeys                []ddForeignKeyJSON `json:"foreign_keys"`
+	CheckConstraints           []ddCheckJSON      `json:"check_constraints"`
 	// frmPartitionClause is a .frm-described table's own PARTITION BY
 	// clause (MyRocks only; InnoDB's .frm path keeps it elsewhere).
 	frmPartitionClause string
@@ -332,8 +343,26 @@ type Column struct {
 	Comment             string
 	GenExpr             string
 	Elements            []string // decoded ENUM/SET labels, 1-indexed by position
-	HasDefault          bool
-	DefaultText         string
+	// DEFAULT clause, as GenerateDDL (sqlout.go) renders it - see
+	// columnDefaultClause for how these combine. HasNoDefault means no
+	// DEFAULT at all (a NOT NULL column declared without one); otherwise
+	// DefaultOption (CURRENT_TIMESTAMP or an expression) wins, then
+	// DefaultIsNull, then the literal DefaultText. DefaultRaw is the
+	// default in the server's own record format, for a binary-charset
+	// string column, whose DefaultText the server writes unreliably
+	// (BINARY padding dropped, a non-UTF-8 value as just "0x").
+	// DefaultIsLiteral means DefaultText is already a SQL literal.
+	HasNoDefault     bool
+	DefaultIsNull    bool
+	DefaultText      string
+	DefaultIsLiteral bool
+	DefaultRaw       []byte
+	DefaultOption    string
+	UpdateOption     string
+	// HasSRID/SRID: the column's SRID attribute (a spatial column restricted
+	// to one spatial reference system); HasSRID false means none.
+	HasSRID bool
+	SRID    uint32
 
 	Mtype    uint32
 	ColLen   uint32 // storage byte length (pack length)
@@ -409,6 +438,39 @@ type SecondaryIndex struct {
 // ForeignKey is one FOREIGN KEY constraint, for DDL output only (this tool
 // never validates or enforces referential integrity - it just walks the
 // clustered index and reproduces what CREATE TABLE said).
+// ddCheckJSON is one CHECK constraint (MySQL 8.0.16+) in the SDI - see
+// dd::Check_constraint. State is enum_constraint_state.
+type ddCheckJSON struct {
+	Name            string `json:"name"`
+	State           uint32 `json:"state"`
+	CheckClauseUtf8 string `json:"check_clause_utf8"`
+}
+
+const ddCheckNotEnforced = 1 // CS_NOT_ENFORCED; CS_ENFORCED is 2
+
+// CheckConstraint is one CHECK constraint, for DDL output only. Clause is
+// the server's own normalized text of the expression, already
+// parenthesized - "(`a` > 0)" - exactly as SHOW CREATE TABLE prints it
+// inside CHECK (...).
+type CheckConstraint struct {
+	Name     string
+	Clause   string
+	Enforced bool
+}
+
+// buildCheckConstraints resolves raw's CHECK constraints, in the order
+// SHOW CREATE TABLE lists them whatever order they were declared in: by
+// name, case-insensitively (constraint names are). The clause text is
+// SDI-escaped like a generated column's expression.
+func buildCheckConstraints(raw *ddTableJSON) []*CheckConstraint {
+	var out []*CheckConstraint
+	for _, cc := range raw.CheckConstraints {
+		out = append(out, &CheckConstraint{Name: cc.Name, Clause: sdiUnescape(cc.CheckClauseUtf8), Enforced: cc.State != ddCheckNotEnforced})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return strings.ToLower(out[i].Name) < strings.ToLower(out[j].Name) })
+	return out
+}
+
 type ForeignKey struct {
 	Name              string
 	Columns           []*Column // this table's own referencing column(s), in order
@@ -460,6 +522,7 @@ type Table struct {
 
 	SecondaryIndexes []*SecondaryIndex
 	ForeignKeys      []*ForeignKey
+	CheckConstraints []*CheckConstraint
 
 	// AUTO_INCREMENT: the SDI carries no persisted "next value" (the server
 	// tracks that separately, outside any single tablespace file), so main.go
@@ -727,8 +790,12 @@ func buildColumn(raw ddColumnJSON) (*Column, error) {
 		Comment:             raw.Comment,
 		GenExpr:             sdiUnescape(raw.GenerationExpressionUtf8),
 		Elements:            decodeElements(raw.Elements),
-		HasDefault:          !raw.HasNoDefault && !raw.DefaultValueUtf8Null,
+		HasNoDefault:        raw.HasNoDefault,
+		DefaultIsNull:       raw.DefaultValueUtf8Null,
 		DefaultText:         raw.DefaultValueUtf8,
+		DefaultIsLiteral:    raw.DefaultIsLiteral,
+		DefaultOption:       raw.DefaultOption,
+		UpdateOption:        raw.UpdateOption,
 		IsSystem:            isSystem,
 	}
 	sep := sePropString(raw.SePrivateData)
@@ -749,6 +816,14 @@ func buildColumn(raw ddColumnJSON) (*Column, error) {
 	} else if v, ok := sep["default"]; ok {
 		if b, err := hex.DecodeString(v); err == nil {
 			c.InstantDefault = b
+		}
+	}
+	if raw.SrsID != nil && !raw.SrsIDNull {
+		c.HasSRID, c.SRID = true, *raw.SrsID
+	}
+	if raw.DefaultValue != "" {
+		if b, err := base64.StdEncoding.DecodeString(raw.DefaultValue); err == nil {
+			c.DefaultRaw = b
 		}
 	}
 	if isSystem {
@@ -1012,6 +1087,7 @@ func BuildTable(raw *ddTableJSON) (*Table, error) {
 			t.ForeignKeys = append(t.ForeignKeys, f)
 		}
 	}
+	t.CheckConstraints = buildCheckConstraints(raw)
 	return t, nil
 }
 
